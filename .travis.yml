@@ -21,14 +21,16 @@ matrix:
         - sudo apt-get --yes update
         - sudo apt-get install --yes apache2-utils cmake cmake-data libev-dev libc-ares-dev libuv-dev php5-cgi wget zlib1g-dev
           # for speed, pre-install deps installed in `before_script` section as ubuntu packages
-        - sudo apt-get install -qq cpanminus libfcgi-perl libfcgi-procmanager-perl libipc-signal-perl libjson-perl liblist-moreutils-perl libpath-tiny-perl libplack-perl libscope-guard-perl libtest-exception-perl libtest-tcp-perl libwww-perl libio-socket-ssl-perl starlet
-        # install openssl 1.1.0, nghttp2, curl with nghttp2
-        - curl -L https://www.openssl.org/source/openssl-1.1.0g.tar.gz | tar xzf -
-        - (cd openssl-1.1.0g && ./config --prefix=/usr/local && make && sudo make install)
+        - sudo apt-get install -qq cpanminus libfcgi-perl libfcgi-procmanager-perl libipc-signal-perl libjson-perl liblist-moreutils-perl libplack-perl libscope-guard-perl libtest-exception-perl libtest-tcp-perl libwww-perl libio-socket-ssl-perl
+        - misc/install-perl-module.pl Path::Tiny
+        - misc/install-perl-module.pl Starlet
+        # install openssl 1.0.2, nghttp2, curl with nghttp2
+        - curl -L https://www.openssl.org/source/openssl-1.0.2n.tar.gz | tar xzf -
+        - (cd openssl-1.0.2n && ./config --prefix=/usr/local && make -j 2 && sudo make install)
         - curl -L https://github.com/nghttp2/nghttp2/releases/download/v1.28.0/nghttp2-1.28.0.tar.gz | tar xzf -
-        - (cd nghttp2-1.28.0 && ./configure --prefix=/usr/local --disable-threads --enable-app && make && sudo make install)
+        - (cd nghttp2-1.28.0 && ./configure --prefix=/usr/local --disable-threads --enable-app && make -j 2 && sudo make install)
         - curl -L https://curl.haxx.se/download/curl-7.50.0.tar.gz | tar xzf -
-        - (cd curl-7.50.0 && ./configure --prefix=/usr/local --with-nghttp2 --disable-shared && make && sudo make install)
+        - (cd curl-7.50.0 && ./configure --prefix=/usr/local --with-nghttp2 --disable-shared && make -j 2 && sudo make install)
       script: &s
         - cmake -DWITH_MRUBY=ON .
         - make all
