@@ -24,6 +24,7 @@
 #endif
 #include <errno.h>
 #include <netinet/in.h>
+#include <netinet/udp.h>
 #include <pthread.h>
 #include <stdio.h>
 #include <sys/socket.h>
@@ -51,56 +52,21 @@ struct st_h2o_http3_ingress_unistream_t {
                          const uint8_t *src_end, int is_eos);
 };
 
-const ptls_iovec_t h2o_http3_alpn[2] = {{(void *)H2O_STRLIT("h3-29")}, {(void *)H2O_STRLIT("h3-27")}};
+const ptls_iovec_t h2o_http3_alpn[3] = {{(void *)H2O_STRLIT("h3")}, {(void *)H2O_STRLIT("h3-29")}, {(void *)H2O_STRLIT("h3-27")}};
 
-static void on_track_sendmsg_timer(h2o_timer_t *timeout);
-
-static struct {
-    /**
-     * counts number of successful invocations of `sendmsg` since the process was launched
-     */
-    uint64_t total_successes;
-    /**
-     * struct that retains information since previous log emission. Needs locked access using `locked.mutex`.
-     */
-    struct {
-        pthread_mutex_t mutex;
-        uint64_t prev_successes;
-        uint64_t cur_failures;
-        int last_errno;
-        h2o_timer_t timer;
-    } locked;
-} track_sendmsg = {.locked = {PTHREAD_MUTEX_INITIALIZER, .timer = {.cb = on_track_sendmsg_timer}}};
-
-void on_track_sendmsg_timer(h2o_timer_t *timeout)
+static void report_sendmsg_errors(h2o_error_reporter_t *reporter, uint64_t total_successes, uint64_t cur_successes)
 {
     char errstr[256];
-
-    pthread_mutex_lock(&track_sendmsg.locked.mutex);
-
-    uint64_t total_successes = __sync_fetch_and_add(&track_sendmsg.total_successes, 0),
-             cur_successes = total_successes - track_sendmsg.locked.prev_successes;
-
     fprintf(stderr, "sendmsg failed %" PRIu64 " time%s, succeeded: %" PRIu64 " time%s, over the last minute: %s\n",
-            track_sendmsg.locked.cur_failures, track_sendmsg.locked.cur_failures > 1 ? "s" : "", cur_successes,
-            cur_successes > 1 ? "s" : "", h2o_strerror_r(track_sendmsg.locked.last_errno, errstr, sizeof(errstr)));
-
-    track_sendmsg.locked.prev_successes = total_successes;
-    track_sendmsg.locked.cur_failures = 0;
-    track_sendmsg.locked.last_errno = 0;
-
-    pthread_mutex_unlock(&track_sendmsg.locked.mutex);
+            reporter->cur_errors, reporter->cur_errors > 1 ? "s" : "", cur_successes, cur_successes > 1 ? "s" : "",
+            h2o_strerror_r((int)reporter->data, errstr, sizeof(errstr)));
 }
 
-/**
- * Sends a packet, returns if the connection is still maintainable (false is returned when not being able to send a packet from the
- * designated source address).
- */
+static h2o_error_reporter_t track_sendmsg = H2O_ERROR_REPORTER_INITIALIZER(report_sendmsg_errors);
+
 int h2o_quic_send_datagrams(h2o_quic_ctx_t *ctx, quicly_address_t *dest, quicly_address_t *src, struct iovec *datagrams,
                             size_t num_datagrams)
 {
-    int ret;
-    struct msghdr mess;
     union {
         struct cmsghdr hdr;
         char buf[
@@ -113,35 +79,38 @@ int h2o_quic_send_datagrams(h2o_quic_ctx_t *ctx, quicly_address_t *dest, quicly_
 #else
             CMSG_SPACE(1)
 #endif
+            +
+#ifdef UDP_SEGMENT
+            CMSG_SPACE(sizeof(uint16_t))
+#else
+            0
+#endif
         ];
-    } cmsg;
+    } cmsgbuf = {.buf = {}};
+    struct cmsghdr *cmsg = &cmsgbuf.hdr;
 
-    /* prepare the fields that remain constant across multiple datagrams */
-    memset(&mess, 0, sizeof(mess));
-    mess.msg_name = &dest->sa;
-    mess.msg_namelen = quicly_get_socklen(&dest->sa);
+    /* first CMSG is the source address */
     if (src->sa.sa_family != AF_UNSPEC) {
         size_t cmsg_bodylen = 0;
-        memset(&cmsg, 0, sizeof(cmsg));
         switch (src->sa.sa_family) {
         case AF_INET: {
 #if defined(IP_PKTINFO)
             if (*ctx->sock.port != src->sin.sin_port)
                 return 0;
-            cmsg.hdr.cmsg_level = IPPROTO_IP;
-            cmsg.hdr.cmsg_type = IP_PKTINFO;
+            cmsg->cmsg_level = IPPROTO_IP;
+            cmsg->cmsg_type = IP_PKTINFO;
             cmsg_bodylen = sizeof(struct in_pktinfo);
-            ((struct in_pktinfo *)CMSG_DATA(&cmsg.hdr))->ipi_spec_dst = src->sin.sin_addr;
+            memcpy(&((struct in_pktinfo *)CMSG_DATA(cmsg))->ipi_spec_dst, &src->sin.sin_addr, sizeof(struct in_addr));
 #elif defined(IP_SENDSRCADDR)
             if (*ctx->sock.port != src->sin.sin_port)
                 return 0;
             struct sockaddr_in *fdaddr = (struct sockaddr_in *)&ctx->sock.addr;
             assert(fdaddr->sin_family == AF_INET);
             if (fdaddr->sin_addr.s_addr == INADDR_ANY) {
-                cmsg.hdr.cmsg_level = IPPROTO_IP;
-                cmsg.hdr.cmsg_type = IP_SENDSRCADDR;
+                cmsg->cmsg_level = IPPROTO_IP;
+                cmsg->cmsg_type = IP_SENDSRCADDR;
                 cmsg_bodylen = sizeof(struct in_addr);
-                *(struct in_addr *)CMSG_DATA(&cmsg.hdr) = src->sin.sin_addr;
+                memcpy(CMSG_DATA(cmsg), &src->sin.sin_addr, sizeof(struct in_addr));
             }
 #else
             h2o_fatal("IP_PKTINFO not available");
@@ -151,10 +120,10 @@ int h2o_quic_send_datagrams(h2o_quic_ctx_t *ctx, quicly_address_t *dest, quicly_
 #ifdef IPV6_PKTINFO
             if (*ctx->sock.port != src->sin6.sin6_port)
                 return 0;
-            cmsg.hdr.cmsg_level = IPPROTO_IPV6;
-            cmsg.hdr.cmsg_type = IPV6_PKTINFO;
+            cmsg->cmsg_level = IPPROTO_IPV6;
+            cmsg->cmsg_type = IPV6_PKTINFO;
             cmsg_bodylen = sizeof(struct in6_pktinfo);
-            ((struct in6_pktinfo *)CMSG_DATA(&cmsg.hdr))->ipi6_addr = src->sin6.sin6_addr;
+            memcpy(&((struct in6_pktinfo *)CMSG_DATA(cmsg))->ipi6_addr, &src->sin6.sin6_addr, sizeof(struct in6_addr));
 #else
             h2o_fatal("IPV6_PKTINFO not available");
 #endif
@@ -163,12 +132,42 @@ int h2o_quic_send_datagrams(h2o_quic_ctx_t *ctx, quicly_address_t *dest, quicly_
             h2o_fatal("unexpected address family");
             break;
         }
-        mess.msg_control = &cmsg;
-        cmsg.hdr.cmsg_len = (socklen_t)CMSG_LEN(cmsg_bodylen);
-        mess.msg_controllen = (socklen_t)CMSG_SPACE(cmsg_bodylen);
+        cmsg->cmsg_len = (socklen_t)CMSG_LEN(cmsg_bodylen);
+        cmsg = (struct cmsghdr *)((char *)cmsg + CMSG_SPACE(cmsg_bodylen));
     }
 
+    /* next CMSG is UDP_SEGMENT size (for GSO) */
+#ifdef UDP_SEGMENT
+    if (num_datagrams > 1) {
+        for (size_t i = 1; i < num_datagrams - 1; ++i)
+            assert(datagrams[i].iov_len == datagrams[0].iov_len);
+        uint16_t segsize = (uint16_t)datagrams[0].iov_len;
+        cmsg->cmsg_level = SOL_UDP;
+        cmsg->cmsg_type = UDP_SEGMENT;
+        cmsg->cmsg_len = CMSG_LEN(sizeof(segsize));
+        memcpy(CMSG_DATA(cmsg), &segsize, sizeof(segsize));
+        cmsg = (struct cmsghdr *)((char *)cmsg + CMSG_SPACE(sizeof(segsize)));
+    }
+#endif
+
     /* send datagrams */
+    struct msghdr mess = {
+        .msg_name = &dest->sa,
+        .msg_namelen = quicly_get_socklen(&dest->sa),
+    };
+    if (cmsg != &cmsgbuf.hdr) {
+        mess.msg_control = &cmsgbuf.buf;
+        mess.msg_controllen = (socklen_t)((char *)cmsg - cmsgbuf.buf);
+    }
+    int ret;
+#ifdef UDP_SEGMENT
+    mess.msg_iov = datagrams;
+    mess.msg_iovlen = num_datagrams;
+    while ((ret = (int)sendmsg(h2o_socket_get_fd(ctx->sock.sock), &mess, 0)) == -1 && errno == EINTR)
+        ;
+    if (ret == -1)
+        goto SendmsgError;
+#else
     for (size_t i = 0; i < num_datagrams; ++i) {
         mess.msg_iov = datagrams + i;
         mess.msg_iovlen = 1;
@@ -177,7 +176,9 @@ int h2o_quic_send_datagrams(h2o_quic_ctx_t *ctx, quicly_address_t *dest, quicly_
         if (ret == -1)
             goto SendmsgError;
     }
-    __sync_fetch_and_add(&track_sendmsg.total_successes, 1);
+#endif
+
+    h2o_error_reporter_record_success(&track_sendmsg);
 
     return 1;
 
@@ -191,12 +192,7 @@ SendmsgError:
      * specific?) */
 
     /* Log the number of failed invocations once per minute, if there has been such a failure. */
-    pthread_mutex_lock(&track_sendmsg.locked.mutex);
-    ++track_sendmsg.locked.cur_failures;
-    track_sendmsg.locked.last_errno = errno;
-    if (!h2o_timer_is_linked(&track_sendmsg.locked.timer))
-        h2o_timer_link(ctx->loop, 60000, &track_sendmsg.locked.timer);
-    pthread_mutex_unlock(&track_sendmsg.locked.mutex);
+    h2o_error_reporter_record_error(ctx->loop, &track_sendmsg, 60000, errno);
 
     return 1;
 }
@@ -615,13 +611,14 @@ static void process_packets(h2o_quic_ctx_t *ctx, quicly_address_t *destaddr, qui
                     if ((conn = ctx->acceptor(ctx, destaddr, srcaddr, packets + i)) != NULL) {
                         /* non-null generally means success, except for H2O_QUIC_ACCEPT_CONN_DECRYPTION_FAILED */
                         if (conn == (h2o_quic_conn_t *)H2O_QUIC_ACCEPT_CONN_DECRYPTION_FAILED) {
-                            /* failed to decrypt Initial packet <=> it could belong to a connection on a different node
-                             * forward it to the right destination */
+                            /* failed to decrypt Initial packet <=> it could belong to a connection on a different node; forward it
+                             * to the destination being claimed by the DCID */
                             uint64_t offending_node_id = packets[i].cid.dest.plaintext.node_id;
-                            conn = NULL;
-                            if (ctx->forward_packets != NULL && ttl > 0)
-                                ctx->forward_packets(ctx, &offending_node_id, packets[i].cid.dest.plaintext.thread_id, destaddr,
-                                                     srcaddr, ttl, packets, num_packets);
+                            uint32_t offending_thread_id = packets[i].cid.dest.plaintext.thread_id;
+                            if (ctx->forward_packets != NULL && ttl > 0 &&
+                                (offending_node_id != ctx->next_cid.node_id || offending_thread_id != ctx->next_cid.thread_id))
+                                ctx->forward_packets(ctx, &offending_node_id, offending_thread_id, destaddr, srcaddr, ttl, packets,
+                                                     num_packets);
                             return;
                         }
                         break;
@@ -663,9 +660,16 @@ static void process_packets(h2o_quic_ctx_t *ctx, quicly_address_t *destaddr, qui
         size_t i;
     Receive:
         for (i = 0; i != num_packets; ++i) {
-            /* FIXME process errors? */
-            if (i != accepted_packet_index)
-                quicly_receive(conn->quic, &destaddr->sa, &srcaddr->sa, packets + i);
+            if (i != accepted_packet_index) {
+                int ret = quicly_receive(conn->quic, &destaddr->sa, &srcaddr->sa, packets + i);
+                switch (ret) {
+                case QUICLY_ERROR_STATE_EXHAUSTION:
+                case PTLS_ERROR_NO_MEMORY:
+                    fprintf(stderr, "%s: `quicly_receive()` returned ret:%d\n", __func__, ret);
+                    conn->callbacks->destroy_connection(conn);
+                    return;
+                }
+            }
         }
     }
 
@@ -676,168 +680,208 @@ static void process_packets(h2o_quic_ctx_t *ctx, quicly_address_t *destaddr, qui
 
 void h2o_quic_read_socket(h2o_quic_ctx_t *ctx, h2o_socket_t *sock)
 {
-    int fd = h2o_socket_get_fd(sock);
-
-    while (1) {
-        uint8_t buf[16384], *bufpt = buf;
-        struct {
-            struct msghdr mess;
-            quicly_address_t destaddr, srcaddr;
-            struct iovec vec;
-            uint8_t ttl;
-            char controlbuf[
+    struct {
+        quicly_address_t destaddr, srcaddr;
+        struct iovec vec;
+        uint8_t ttl;
+        char controlbuf[
 #ifdef IPV6_PKTINFO
-                CMSG_SPACE(sizeof(struct in6_pktinfo))
+            CMSG_SPACE(sizeof(struct in6_pktinfo))
 #elif defined(IP_PKTINFO)
-                CMSG_SPACE(sizeof(struct in_pktinfo))
+            CMSG_SPACE(sizeof(struct in_pktinfo))
 #elif defined(IP_RECVDSTADDR)
-                CMSG_SPACE(sizeof(struct in_addr))
+            CMSG_SPACE(sizeof(struct in_addr))
 #else
-                CMSG_SPACE(1)
+            CMSG_SPACE(1)
 #endif
-            ];
-        } dgrams[32];
-        size_t dgram_index, num_dgrams;
-        ssize_t rret;
+        ];
+        uint8_t buf[1600];
+    } dgrams[10];
+#ifdef __linux__
+    struct mmsghdr mess[PTLS_ELEMENTSOF(dgrams)];
+#else
+    struct {
+        struct msghdr msg_hdr;
+    } mess[PTLS_ELEMENTSOF(dgrams)];
+#endif
 
-        /* read datagrams */
-        for (dgram_index = 0; dgram_index < sizeof(dgrams) / sizeof(dgrams[0]) && buf + sizeof(buf) - bufpt > 2048; ++dgram_index) {
-            /* read datagram */
-        Read:
-            memset(dgrams + dgram_index, 0, sizeof(dgrams[dgram_index]));
-            dgrams[dgram_index].mess.msg_name = &dgrams[dgram_index].srcaddr;
-            dgrams[dgram_index].mess.msg_namelen = sizeof(dgrams[dgram_index].srcaddr);
-            dgrams[dgram_index].vec.iov_base = bufpt;
-            dgrams[dgram_index].vec.iov_len = buf + sizeof(buf) - bufpt;
-            dgrams[dgram_index].mess.msg_iov = &dgrams[dgram_index].vec;
-            dgrams[dgram_index].mess.msg_iovlen = 1;
-            dgrams[dgram_index].mess.msg_control = &dgrams[dgram_index].controlbuf;
-            dgrams[dgram_index].mess.msg_controllen = sizeof(dgrams[dgram_index].controlbuf);
-            while ((rret = recvmsg(fd, &dgrams[dgram_index].mess, 0)) <= 0 && errno == EINTR)
-                ;
-            if (rret <= 0)
-                break;
-            dgrams[dgram_index].vec.iov_len = rret;
-            { /* fetch destination address */
-                struct cmsghdr *cmsg;
-                for (cmsg = CMSG_FIRSTHDR(&dgrams[dgram_index].mess); cmsg != NULL;
-                     cmsg = CMSG_NXTHDR(&dgrams[dgram_index].mess, cmsg)) {
+#define INIT_DGRAMS(i)                                                                                                             \
+    do {                                                                                                                           \
+        mess[i].msg_hdr = (struct msghdr){                                                                                         \
+            .msg_name = &dgrams[i].srcaddr,                                                                                        \
+            .msg_namelen = sizeof(dgrams[i].srcaddr),                                                                              \
+            .msg_iov = &dgrams[i].vec,                                                                                             \
+            .msg_iovlen = 1,                                                                                                       \
+            .msg_control = &dgrams[i].controlbuf,                                                                                  \
+            .msg_controllen = sizeof(dgrams[i].controlbuf),                                                                        \
+        };                                                                                                                         \
+        memset(&dgrams[i].destaddr, 0, sizeof(dgrams[i].destaddr));                                                                \
+        dgrams[i].vec.iov_base = dgrams[i].buf;                                                                                    \
+        dgrams[i].vec.iov_len = sizeof(dgrams[i].buf);                                                                             \
+    } while (0)
+
+    int fd = h2o_socket_get_fd(sock);
+    size_t dgram_index, num_dgrams;
+
+    /* Read datagrams. Sender should be provided an ACK every fraction of RTT, otherwise its behavior becomes bursty (assuming that
+     * pacing is not used), rather than packets being spread across entire round-trip. To minimize the chance of us entering such
+     * situation, number of datagrams being read at once is limited to `PTLS_ELEMENTSOF(dgrams)`. In other words, one ack is
+     * generated for no more than every 10 ack-eliciting packets being received, unless the ack-frequency extension is used. */
+#ifdef __linux__
+    {
+        int rret;
+        do {
+            for (dgram_index = 0; dgram_index < PTLS_ELEMENTSOF(dgrams); ++dgram_index)
+                INIT_DGRAMS(dgram_index);
+        } while ((rret = recvmmsg(fd, mess, PTLS_ELEMENTSOF(mess), 0, NULL)) < 0 && errno == EINTR);
+        if (rret <= 0)
+            goto Exit;
+        num_dgrams = (size_t)rret;
+        for (dgram_index = 0; dgram_index < num_dgrams; ++dgram_index)
+            dgrams[dgram_index].vec.iov_len = (size_t)mess[dgram_index].msg_len;
+    }
+#else
+    for (dgram_index = 0; dgram_index < PTLS_ELEMENTSOF(dgrams); ++dgram_index) {
+        ssize_t rret;
+        do {
+            INIT_DGRAMS(dgram_index);
+        } while ((rret = recvmsg(fd, &mess[dgram_index].msg_hdr, 0)) < 0 && errno == EINTR);
+        if (rret < 0)
+            break;
+        dgrams[dgram_index].vec.iov_len = rret;
+    }
+    num_dgrams = dgram_index;
+    if (num_dgrams == 0)
+        goto Exit;
+#endif
+
+    /* normalize and store the obtained data into `dgrams` */
+    for (dgram_index = 0; dgram_index < num_dgrams; ++dgram_index) {
+        { /* fetch destination address */
+            struct cmsghdr *cmsg;
+            for (cmsg = CMSG_FIRSTHDR(&mess[dgram_index].msg_hdr); cmsg != NULL;
+                 cmsg = CMSG_NXTHDR(&mess[dgram_index].msg_hdr, cmsg)) {
 #ifdef IP_PKTINFO
-                    if (cmsg->cmsg_level == IPPROTO_IP && cmsg->cmsg_type == IP_PKTINFO) {
-                        dgrams[dgram_index].destaddr.sin.sin_family = AF_INET;
-                        dgrams[dgram_index].destaddr.sin.sin_addr = ((struct in_pktinfo *)CMSG_DATA(cmsg))->ipi_addr;
-                        dgrams[dgram_index].destaddr.sin.sin_port = *ctx->sock.port;
-                        goto DestAddrFound;
-                    }
+                if (cmsg->cmsg_level == IPPROTO_IP && cmsg->cmsg_type == IP_PKTINFO) {
+                    dgrams[dgram_index].destaddr.sin.sin_family = AF_INET;
+                    dgrams[dgram_index].destaddr.sin.sin_addr = ((struct in_pktinfo *)CMSG_DATA(cmsg))->ipi_addr;
+                    dgrams[dgram_index].destaddr.sin.sin_port = *ctx->sock.port;
+                    goto DestAddrFound;
+                }
 #endif
 #ifdef IP_RECVDSTADDR
-                    if (cmsg->cmsg_level == IPPROTO_IP && cmsg->cmsg_type == IP_RECVDSTADDR) {
-                        dgrams[dgram_index].destaddr.sin.sin_family = AF_INET;
-                        dgrams[dgram_index].destaddr.sin.sin_addr = *(struct in_addr *)CMSG_DATA(cmsg);
-                        dgrams[dgram_index].destaddr.sin.sin_port = *ctx->sock.port;
-                        goto DestAddrFound;
-                    }
+                if (cmsg->cmsg_level == IPPROTO_IP && cmsg->cmsg_type == IP_RECVDSTADDR) {
+                    dgrams[dgram_index].destaddr.sin.sin_family = AF_INET;
+                    dgrams[dgram_index].destaddr.sin.sin_addr = *(struct in_addr *)CMSG_DATA(cmsg);
+                    dgrams[dgram_index].destaddr.sin.sin_port = *ctx->sock.port;
+                    goto DestAddrFound;
+                }
 #endif
 #ifdef IPV6_PKTINFO
-                    if (cmsg->cmsg_level == IPPROTO_IPV6 && cmsg->cmsg_type == IPV6_PKTINFO) {
-                        dgrams[dgram_index].destaddr.sin6.sin6_family = AF_INET6;
-                        dgrams[dgram_index].destaddr.sin6.sin6_addr = ((struct in6_pktinfo *)CMSG_DATA(cmsg))->ipi6_addr;
-                        dgrams[dgram_index].destaddr.sin6.sin6_port = *ctx->sock.port;
-                        goto DestAddrFound;
-                    }
+                if (cmsg->cmsg_level == IPPROTO_IPV6 && cmsg->cmsg_type == IPV6_PKTINFO) {
+                    dgrams[dgram_index].destaddr.sin6.sin6_family = AF_INET6;
+                    dgrams[dgram_index].destaddr.sin6.sin6_addr = ((struct in6_pktinfo *)CMSG_DATA(cmsg))->ipi6_addr;
+                    dgrams[dgram_index].destaddr.sin6.sin6_port = *ctx->sock.port;
+                    goto DestAddrFound;
+                }
 #endif
-                }
-                dgrams[dgram_index].destaddr.sa.sa_family = AF_UNSPEC;
-            DestAddrFound:;
             }
-            dgrams[dgram_index].ttl = ctx->default_ttl;
-            if (ctx->preprocess_packet != NULL) {
-                /* preprocess (and drop the packet if it failed) */
-                if (!ctx->preprocess_packet(ctx, &dgrams[dgram_index].mess, &dgrams[dgram_index].destaddr,
-                                            &dgrams[dgram_index].srcaddr, &dgrams[dgram_index].ttl))
-                    goto Read;
-            }
-            assert(dgrams[dgram_index].srcaddr.sa.sa_family == AF_INET || dgrams[dgram_index].srcaddr.sa.sa_family == AF_INET6);
-            bufpt += rret;
+            dgrams[dgram_index].destaddr.sa.sa_family = AF_UNSPEC;
+        DestAddrFound:;
         }
-        num_dgrams = dgram_index;
-        if (num_dgrams == 0)
-            break;
+        dgrams[dgram_index].ttl = ctx->default_ttl;
+        /* preprocess (and drop the packet if it failed) */
+        if (ctx->preprocess_packet != NULL &&
+            !ctx->preprocess_packet(ctx, &mess[dgram_index].msg_hdr, &dgrams[dgram_index].destaddr,
+                                    &dgrams[dgram_index].srcaddr, &dgrams[dgram_index].ttl)) {
+            dgrams[dgram_index].vec.iov_len = 0; /* mark as unused */
+        } else {
+            assert(dgrams[dgram_index].srcaddr.sa.sa_family == AF_INET || dgrams[dgram_index].srcaddr.sa.sa_family == AF_INET6);
+        }
+    }
 
-        /* convert dgrams to decoded packets and process them in group of (4-tuple, dcid) */
-        quicly_decoded_packet_t packets[64];
-        size_t packet_index = 0;
-        dgram_index = 0;
-        while (dgram_index < num_dgrams) {
-            int has_decoded = 0; /* indicates if a decoded packet belonging to a different connection is stored at
-                                  * `packets[packet_index]` */
-            /* dispatch packets in `packets`, if the datagram at dgram_index is from a different path */
-            if (packet_index != 0) {
-                assert(dgram_index != 0);
-                /* check source address */
-                if (h2o_socket_compare_address(&dgrams[dgram_index - 1].srcaddr.sa, &dgrams[dgram_index].srcaddr.sa, 1) != 0)
-                    goto ProcessPackets;
-                /* check destination address, if available */
-                if (dgrams[dgram_index - 1].destaddr.sa.sa_family == AF_UNSPEC &&
-                    dgrams[dgram_index].destaddr.sa.sa_family == AF_UNSPEC) {
-                    /* ok */
-                } else if (h2o_socket_compare_address(&dgrams[dgram_index - 1].destaddr.sa, &dgrams[dgram_index].destaddr.sa, 1) ==
-                           0) {
-                    /* ok */
-                } else {
-                    goto ProcessPackets;
-                }
-                /* TTL should be same for dispatched packets */
-                if (dgrams[dgram_index - 1].ttl != dgrams[dgram_index].ttl)
-                    goto ProcessPackets;
+    /* convert dgrams to decoded packets and process them in group of (4-tuple, dcid) */
+    quicly_decoded_packet_t packets[64];
+    size_t packet_index = 0;
+    dgram_index = 0;
+    while (dgram_index < num_dgrams) {
+        int has_decoded = 0; /* indicates if a decoded packet belonging to a different connection is stored at
+                              * `packets[packet_index]` */
+        /* skip zero-sized datagrams (or the ones for which preprocessing failed) */
+        if (dgrams[dgram_index].vec.iov_len == 0) {
+            ++dgram_index;
+            continue;
+        }
+        /* dispatch packets in `packets`, if the datagram at dgram_index is from a different path */
+        if (packet_index != 0) {
+            assert(dgram_index != 0);
+            /* check source address */
+            if (h2o_socket_compare_address(&dgrams[dgram_index - 1].srcaddr.sa, &dgrams[dgram_index].srcaddr.sa, 1) != 0)
+                goto ProcessPackets;
+            /* check destination address, if available */
+            if (dgrams[dgram_index - 1].destaddr.sa.sa_family == AF_UNSPEC &&
+                dgrams[dgram_index].destaddr.sa.sa_family == AF_UNSPEC) {
+                /* ok */
+            } else if (h2o_socket_compare_address(&dgrams[dgram_index - 1].destaddr.sa, &dgrams[dgram_index].destaddr.sa, 1) ==
+                       0) {
+                /* ok */
+            } else {
+                goto ProcessPackets;
             }
-            /* decode the first packet */
-            size_t payload_off = 0;
-            if (quicly_decode_packet(ctx->quic, packets + packet_index, dgrams[dgram_index].vec.iov_base,
-                                     dgrams[dgram_index].vec.iov_len, &payload_off) == SIZE_MAX) {
+            /* TTL should be same for dispatched packets */
+            if (dgrams[dgram_index - 1].ttl != dgrams[dgram_index].ttl)
+                goto ProcessPackets;
+        }
+        /* decode the first packet */
+        size_t payload_off = 0;
+        if (quicly_decode_packet(ctx->quic, packets + packet_index, dgrams[dgram_index].vec.iov_base,
+                                 dgrams[dgram_index].vec.iov_len, &payload_off) == SIZE_MAX) {
+            ++dgram_index;
+            goto ProcessPackets;
+        }
+        /* dispatch packets in `packets` if the DCID is different, setting the `has_decoded` flag */
+        if (packet_index != 0) {
+            const ptls_iovec_t *prev_dcid = &packets[packet_index - 1].cid.dest.encrypted,
+                               *cur_dcid = &packets[packet_index].cid.dest.encrypted;
+            if (!(prev_dcid->len == cur_dcid->len && memcmp(prev_dcid->base, cur_dcid->base, prev_dcid->len) == 0)) {
+                has_decoded = 1;
                 ++dgram_index;
                 goto ProcessPackets;
             }
-            /* dispatch packets in `packets` if the DCID is different, setting the `has_decoded` flag */
-            if (packet_index != 0) {
-                const ptls_iovec_t *prev_dcid = &packets[packet_index - 1].cid.dest.encrypted,
-                                   *cur_dcid = &packets[packet_index].cid.dest.encrypted;
-                if (!(prev_dcid->len == cur_dcid->len && memcmp(prev_dcid->base, cur_dcid->base, prev_dcid->len) == 0)) {
-                    has_decoded = 1;
-                    ++dgram_index;
-                    goto ProcessPackets;
-                }
-            }
+        }
+        ++packet_index;
+        /* add rest of the packets */
+        while (payload_off < dgrams[dgram_index].vec.iov_len && packet_index < PTLS_ELEMENTSOF(packets)) {
+            if (quicly_decode_packet(ctx->quic, packets + packet_index, dgrams[dgram_index].vec.iov_base,
+                                     dgrams[dgram_index].vec.iov_len, &payload_off) == SIZE_MAX)
+                break;
             ++packet_index;
-            /* add rest of the packets */
-            while (payload_off < dgrams[dgram_index].vec.iov_len && packet_index < PTLS_ELEMENTSOF(packets)) {
-                if (quicly_decode_packet(ctx->quic, packets + packet_index, dgrams[dgram_index].vec.iov_base,
-                                         dgrams[dgram_index].vec.iov_len, &payload_off) == SIZE_MAX)
-                    break;
-                ++packet_index;
-            }
-            ++dgram_index;
-            /* if we have enough room for the next datagram, that is, the expected worst case of 4 packets in a coalesced datagram,
-             * continue */
-            if (packet_index + 4 < PTLS_ELEMENTSOF(packets))
-                continue;
+        }
+        ++dgram_index;
+        /* if we have enough room for the next datagram, that is, the expected worst case of 4 packets in a coalesced datagram,
+         * continue */
+        if (packet_index + 4 < PTLS_ELEMENTSOF(packets))
+            continue;
 
-        ProcessPackets:
-            if (packet_index != 0) {
-                process_packets(ctx, &dgrams[dgram_index - 1].destaddr, &dgrams[dgram_index - 1].srcaddr,
-                                dgrams[dgram_index - 1].ttl, packets, packet_index);
-                if (has_decoded) {
-                    packets[0] = packets[packet_index];
-                    packet_index = 1;
-                } else {
-                    packet_index = 0;
-                }
+    ProcessPackets:
+        if (packet_index != 0) {
+            process_packets(ctx, &dgrams[dgram_index - 1].destaddr, &dgrams[dgram_index - 1].srcaddr,
+                            dgrams[dgram_index - 1].ttl, packets, packet_index);
+            if (has_decoded) {
+                packets[0] = packets[packet_index];
+                packet_index = 1;
+            } else {
+                packet_index = 0;
             }
         }
-        if (packet_index != 0)
-            process_packets(ctx, &dgrams[dgram_index - 1].destaddr, &dgrams[dgram_index - 1].srcaddr, dgrams[dgram_index - 1].ttl,
-                            packets, packet_index);
     }
+    if (packet_index != 0)
+        process_packets(ctx, &dgrams[dgram_index - 1].destaddr, &dgrams[dgram_index - 1].srcaddr, dgrams[dgram_index - 1].ttl,
+                        packets, packet_index);
+
+Exit:;
+
+#undef INIT_DGRAMS
 }
 
 static void on_read(h2o_socket_t *sock, const char *err)
@@ -1003,12 +1047,15 @@ void h2o_quic_close_all_connections(h2o_quic_ctx_t *ctx)
     h2o_quic_conn_t *conn;
 
     kh_foreach_value(ctx->conns_by_id, conn, { h2o_quic_close_connection(conn, 0, NULL); });
-    kh_foreach_value(ctx->conns_accepting, conn, { h2o_quic_close_connection(conn, 0, NULL); });
+    /* closing a connection should also remove an entry from conns_accepting */
+    assert(kh_size(ctx->conns_accepting) == 0);
 }
 
 size_t h2o_quic_num_connections(h2o_quic_ctx_t *ctx)
 {
-    return kh_size(ctx->conns_by_id) + kh_size(ctx->conns_accepting);
+    /* throughout its lifetime, a connection is always registered to both conns_by_id and conns_accepting,
+       thus counting conns_by_id is enough */
+    return kh_size(ctx->conns_by_id);
 }
 
 void h2o_quic_init_conn(h2o_quic_conn_t *conn, h2o_quic_ctx_t *ctx, const h2o_quic_conn_callbacks_t *callbacks)
@@ -1103,27 +1150,25 @@ int h2o_quic_send(h2o_quic_conn_t *conn)
 {
     quicly_address_t dest, src;
     struct iovec datagrams[10];
-    size_t num_datagrams;
+    size_t num_datagrams = PTLS_ELEMENTSOF(datagrams);
     uint8_t datagram_buf[1500 * PTLS_ELEMENTSOF(datagrams)];
 
-    do {
-        num_datagrams = PTLS_ELEMENTSOF(datagrams);
-        int ret = quicly_send(conn->quic, &dest, &src, datagrams, &num_datagrams, datagram_buf, sizeof(datagram_buf));
-        switch (ret) {
-        case 0:
-            if (num_datagrams != 0 && !h2o_quic_send_datagrams(conn->ctx, &dest, &src, datagrams, num_datagrams)) {
-                /* FIXME close the connection immediately */
-                break;
-            }
+    int ret = quicly_send(conn->quic, &dest, &src, datagrams, &num_datagrams, datagram_buf, sizeof(datagram_buf));
+    switch (ret) {
+    case 0:
+        if (num_datagrams != 0 && !h2o_quic_send_datagrams(conn->ctx, &dest, &src, datagrams, num_datagrams)) {
+            /* FIXME close the connection immediately */
             break;
-        case QUICLY_ERROR_FREE_CONNECTION:
-            conn->callbacks->destroy_connection(conn);
-            return 0;
-        default:
-            fprintf(stderr, "quicly_send returned %d\n", ret);
-            abort();
         }
-    } while (num_datagrams == PTLS_ELEMENTSOF(datagrams));
+        break;
+    case QUICLY_ERROR_STATE_EXHAUSTION:
+    case QUICLY_ERROR_FREE_CONNECTION:
+        conn->callbacks->destroy_connection(conn);
+        return 0;
+    default:
+        fprintf(stderr, "quicly_send returned %d\n", ret);
+        abort();
+    }
 
     h2o_quic_schedule_timer(conn);
 

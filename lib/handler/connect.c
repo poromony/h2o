@@ -54,13 +54,21 @@ struct st_connect_request_t {
     h2o_timer_t timeout;
 };
 
-#define TO_BITMASK(type, len) ((type)~(((type)1 << (sizeof(type) * 8 - (len))) - 1))
+#define TO_BITMASK(type, len) ((type) ~(((type)1 << (sizeof(type) * 8 - (len))) - 1))
 
 static void start_connect(struct st_connect_request_t *creq);
 
 static void on_error(struct st_connect_request_t *creq, const char *errstr)
 {
     h2o_timer_unlink(&creq->timeout);
+    if (creq->getaddr_req != NULL) {
+        h2o_hostinfo_getaddr_cancel(creq->getaddr_req);
+        creq->getaddr_req = NULL;
+    }
+    if (creq->sock != NULL) {
+        h2o_socket_close(creq->sock);
+        creq->sock = NULL;
+    }
     h2o_send_error_502(creq->src_req, "Gateway Error", errstr, 0);
 }
 
@@ -74,11 +82,15 @@ static void on_connect(h2o_socket_t *sock, const char *err)
 {
     struct st_connect_request_t *creq = sock->data;
 
+    assert(creq->sock == sock);
+
     if (err) {
         if (creq->server_addresses.next == creq->server_addresses.size) {
             on_error(creq, err);
             return;
         }
+        h2o_socket_close(sock);
+        creq->sock = NULL;
         start_connect(creq);
         return;
     }
@@ -105,9 +117,9 @@ static void on_generator_dispose(void *_self)
         h2o_hostinfo_getaddr_cancel(creq->getaddr_req);
         creq->getaddr_req = NULL;
     }
-
     if (creq->sock != NULL)
         h2o_socket_close(creq->sock);
+    h2o_timer_unlink(&creq->timeout);
 }
 
 static void store_server_addresses(struct st_connect_request_t *creq, struct addrinfo *res)
@@ -153,6 +165,11 @@ static void start_connect(struct st_connect_request_t *creq)
         /* connect */
         if ((creq->sock = h2o_socket_connect(creq->loop, server_address->sa, server_address->salen, on_connect)) != NULL) {
             creq->sock->data = creq;
+#if !H2O_USE_LIBUV
+            /* This is the maximum amount of data that will be buffered within userspace. It is hard-coded to 64KB to balance
+             * throughput and latency, and because we do not expect the need to change the value. */
+            h2o_evloop_socket_set_max_read_size(creq->sock, 64 * 1024);
+#endif
             return;
         }
     } while (creq->server_addresses.next < creq->server_addresses.size);
@@ -196,6 +213,8 @@ static int on_req(h2o_handler_t *_handler, h2o_req_t *req)
 void h2o_connect_register(h2o_pathconf_t *pathconf, h2o_proxy_config_vars_t *config, h2o_connect_acl_entry_t *acl_entries,
                           size_t num_acl_entries)
 {
+    assert(config->max_buffer_size != 0);
+
     struct st_connect_handler_t *self = (void *)h2o_create_handler(pathconf, offsetof(struct st_connect_handler_t, acl.entries) +
                                                                                  sizeof(*self->acl.entries) * num_acl_entries);
 
@@ -265,7 +284,7 @@ const char *h2o_connect_parse_acl(h2o_connect_acl_entry_t *output, const char *i
         for (i = 0; i < output->addr_mask / 8; ++i)
             output->addr.v6[i] = v6addr.s6_addr[i];
         if (output->addr_mask % 8 != 0)
-            output->addr.v6[i] = v6addr.s6_addr[i] & TO_BITMASK(uint8_t, v6addr.s6_addr[i]);
+            output->addr.v6[i] = v6addr.s6_addr[i] & TO_BITMASK(uint8_t, output->addr_mask % 8);
         for (++i; i < PTLS_ELEMENTSOF(output->addr.v6); ++i)
             output->addr.v6[i] = 0;
     } else {

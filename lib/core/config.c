@@ -190,6 +190,7 @@ void h2o_config_init(h2o_globalconf_t *config)
     config->proxy.emit_via_header = 1;
     config->proxy.emit_missing_date_header = 1;
     config->http2.max_concurrent_requests_per_connection = H2O_HTTP2_SETTINGS_HOST_MAX_CONCURRENT_STREAMS;
+    config->http2.max_concurrent_streaming_requests_per_connection = H2O_HTTP2_SETTINGS_HOST_MAX_CONCURRENT_STREAMING_REQUESTS;
     config->http2.max_streams_for_priority = 16;
     config->http2.active_stream_window_size = H2O_DEFAULT_HTTP2_ACTIVE_STREAM_WINDOW_SIZE;
     config->http2.latency_optimization.min_rtt = 50; // milliseconds
@@ -205,6 +206,11 @@ void h2o_config_init(h2o_globalconf_t *config)
     h2o_socketpool_init_global(&config->proxy.global_socketpool, SIZE_MAX);
 
     h2o_configurator__init_core(config);
+
+    config->fallback_host = create_hostconf(config);
+    config->fallback_host->authority.port = 65535;
+    config->fallback_host->authority.host = h2o_strdup(NULL, H2O_STRLIT("*"));
+    config->fallback_host->authority.hostport = h2o_strdup(NULL, H2O_STRLIT("*"));
 }
 
 h2o_pathconf_t *h2o_config_register_path(h2o_hostconf_t *hostconf, const char *path, int flags)
@@ -284,6 +290,8 @@ void h2o_config_dispose(h2o_globalconf_t *config)
         destroy_hostconf(hostconf);
     }
     free(config->hosts);
+
+    destroy_hostconf(config->fallback_host);
 
     h2o_socketpool_dispose(&config->proxy.global_socketpool);
     h2o_mem_release_shared(config->mimemap);
