@@ -22,7 +22,7 @@
 #include <inttypes.h>
 #include "h2o.h"
 
-#define SEND_WAIT 500 /* how frequent new loglines should be pushed out; in milliseconds */
+#define SEND_WAIT 500        /* how frequent new loglines should be pushed out; in milliseconds */
 #define BUFFER_LIMIT 8388608 /* do not buffer more than 8MB */
 
 struct h2o_self_trace_generator {
@@ -70,7 +70,6 @@ static void adjust_send_timer(struct h2o_self_trace_generator *self)
         h2o_timer_link(self->req->conn->ctx->loop, SEND_WAIT, &self->send_timer);
 }
 
-
 static void log_trace(void *_self, const char *fmt, ...)
 {
     struct h2o_self_trace_generator *self = _self;
@@ -78,18 +77,19 @@ static void log_trace(void *_self, const char *fmt, ...)
     /* append provided input to the buffer */
     if (self->buf->size < BUFFER_LIMIT) {
         va_list args;
-        va_start(args, fmt);
 
         h2o_iovec_t buf = h2o_buffer_reserve(&self->buf, 1024);
+        va_start(args, fmt);
         int len = vsnprintf(buf.base, buf.len, fmt, args);
+        va_end(args);
         if (len >= buf.len) {
             buf = h2o_buffer_reserve(&self->buf, len + 1);
+            va_start(args, fmt);
             len = vsnprintf(buf.base, buf.len, fmt, args);
+            va_end(args);
             assert(len < buf.len);
         }
         self->buf->size += len;
-
-        va_end(args);
     }
 
     /* Log is sent only when there's another request inflight. Otherwise, it is buffered until another request becomes inflight. */

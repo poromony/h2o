@@ -41,9 +41,9 @@ typedef struct st_quicly_sent_packet_t {
      */
     uint64_t packet_number;
     /**
-     *
+     * time at which the packet was sent (or INFINITY for the end-of-iteration sentinel)
      */
-    int64_t sent_at;
+    double sent_at;
     /**
      * epoch to be acked in
      */
@@ -56,6 +56,10 @@ typedef struct st_quicly_sent_packet_t {
      * if the frames being contained are considered inflight (becomes zero when deemed lost or when PTO fires)
      */
     uint8_t frames_in_flight : 1;
+    /**
+     * if sent on a promoted path
+     */
+    uint8_t promoted_path : 1;
     /**
      * number of bytes in-flight for the packet, from the context of CC (becomes zero when deemed lost, but not when PTO fires)
      */
@@ -89,7 +93,8 @@ typedef enum en_quicly_sentmap_event_t {
  * @param acked   true if acked, false if the information has to be scheduled for retransmission
  * @param data    data
  */
-typedef int (*quicly_sent_acked_cb)(quicly_sentmap_t *map, const quicly_sent_packet_t *packet, int acked, quicly_sent_t *data);
+typedef quicly_error_t (*quicly_sent_acked_cb)(quicly_sentmap_t *map, const quicly_sent_packet_t *packet, int acked,
+                                               quicly_sent_t *data);
 
 struct st_quicly_sent_ack_additional_t {
     uint8_t gap;
@@ -211,6 +216,10 @@ struct st_quicly_sentmap_t {
      */
     size_t num_packets;
     /**
+     * largest number recorded for num_packets
+     */
+    size_t num_packets_largest;
+    /**
      * bytes in-flight
      */
     size_t bytes_in_flight;
@@ -244,11 +253,11 @@ static int quicly_sentmap_is_open(quicly_sentmap_t *map);
 /**
  * prepares a write
  */
-int quicly_sentmap_prepare(quicly_sentmap_t *map, uint64_t packet_number, int64_t now, uint8_t ack_epoch);
+quicly_error_t quicly_sentmap_prepare(quicly_sentmap_t *map, uint64_t packet_number, double now, uint8_t ack_epoch);
 /**
  * commits a write
  */
-static void quicly_sentmap_commit(quicly_sentmap_t *map, uint16_t bytes_in_flight);
+static void quicly_sentmap_commit(quicly_sentmap_t *map, uint16_t bytes_in_flight, int promoted_path);
 /**
  * Allocates a slot to contain a callback for a frame.  The function MUST be called after _prepare but before _commit.
  */
@@ -269,10 +278,11 @@ void quicly_sentmap_skip(quicly_sentmap_iter_t *iter);
 /**
  * updates the state of the packet being pointed to by the iterator, _and advances to the next packet_
  */
-int quicly_sentmap_update(quicly_sentmap_t *map, quicly_sentmap_iter_t *iter, quicly_sentmap_event_t event);
+quicly_error_t quicly_sentmap_update(quicly_sentmap_t *map, quicly_sentmap_iter_t *iter, quicly_sentmap_event_t event);
 
 struct st_quicly_sent_block_t *quicly_sentmap__new_block(quicly_sentmap_t *map);
-int quicly_sentmap__type_packet(quicly_sentmap_t *map, const quicly_sent_packet_t *packet, int acked, quicly_sent_t *sent);
+quicly_error_t quicly_sentmap__type_packet(quicly_sentmap_t *map, const quicly_sent_packet_t *packet, int acked,
+                                           quicly_sent_t *sent);
 
 /* inline definitions */
 
@@ -286,7 +296,7 @@ inline int quicly_sentmap_is_open(quicly_sentmap_t *map)
     return map->_pending_packet != NULL;
 }
 
-inline void quicly_sentmap_commit(quicly_sentmap_t *map, uint16_t bytes_in_flight)
+inline void quicly_sentmap_commit(quicly_sentmap_t *map, uint16_t bytes_in_flight, int promoted_path)
 {
     assert(quicly_sentmap_is_open(map));
 
@@ -296,9 +306,13 @@ inline void quicly_sentmap_commit(quicly_sentmap_t *map, uint16_t bytes_in_fligh
         map->bytes_in_flight += bytes_in_flight;
     }
     map->_pending_packet->data.packet.frames_in_flight = 1;
+    if (promoted_path)
+        map->_pending_packet->data.packet.promoted_path = 1;
     map->_pending_packet = NULL;
 
     ++map->num_packets;
+    if (map->num_packets > map->num_packets_largest)
+        map->num_packets_largest = map->num_packets;
 }
 
 inline quicly_sent_t *quicly_sentmap_allocate(quicly_sentmap_t *map, quicly_sent_acked_cb acked)

@@ -40,9 +40,9 @@ typedef struct st_quicly_sendbuf_vec_t quicly_sendbuf_vec_t;
  * @param dst the destination
  * @param off offset within the iovec from where serialization should happen
  * @param len number of bytes to serialize
- * @return 0 if successful, otherwise an error code
+ * @return 0 if successful, otherwise an application error code, which is used for resetting the stream
  */
-typedef int (*quicly_sendbuf_flatten_vec_cb)(quicly_sendbuf_vec_t *vec, void *dst, size_t off, size_t len);
+typedef quicly_error_t (*quicly_sendbuf_flatten_vec_cb)(quicly_sendbuf_vec_t *vec, void *dst, size_t off, size_t len);
 /**
  * An optional callback that is called when an iovec is discarded.
  */
@@ -72,7 +72,7 @@ typedef struct st_quicly_sendbuf_t {
 } quicly_sendbuf_t;
 
 /**
- * Inilializes the send buffer.
+ * Initializes the send buffer.
  */
 static void quicly_sendbuf_init(quicly_sendbuf_t *sb);
 /**
@@ -122,12 +122,16 @@ typedef struct st_quicly_streambuf_t {
 } quicly_streambuf_t;
 
 int quicly_streambuf_create(quicly_stream_t *stream, size_t sz);
-void quicly_streambuf_destroy(quicly_stream_t *stream, int err);
+void quicly_streambuf_destroy(quicly_stream_t *stream, quicly_error_t err);
 static void quicly_streambuf_egress_shift(quicly_stream_t *stream, size_t delta);
 void quicly_streambuf_egress_emit(quicly_stream_t *stream, size_t off, void *dst, size_t *len, int *wrote_all);
 static int quicly_streambuf_egress_write(quicly_stream_t *stream, const void *src, size_t len);
 static int quicly_streambuf_egress_write_vec(quicly_stream_t *stream, quicly_sendbuf_vec_t *vec);
 int quicly_streambuf_egress_shutdown(quicly_stream_t *stream);
+/**
+ * Resets the stream while making sure that all bytes up to `reliable_size` are received.
+ */
+quicly_error_t quicly_streambuf_egress_reset(quicly_stream_t *stream, quicly_error_t err, uint64_t reliable_size);
 static void quicly_streambuf_ingress_shift(quicly_stream_t *stream, size_t delta);
 static ptls_iovec_t quicly_streambuf_ingress_get(quicly_stream_t *stream);
 /**

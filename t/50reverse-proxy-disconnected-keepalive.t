@@ -1,7 +1,7 @@
 use strict;
 use warnings;
 use File::Temp qw(tempfile);
-use Net::EmptyPort qw(check_port empty_port);
+use Net::EmptyPort qw(check_port);
 use Test::More;
 use t::Util;
 
@@ -23,7 +23,7 @@ subtest "unix-socket" => sub {
 
     (undef, my $sockfn) = tempfile(UNLINK => 0);
     unlink $sockfn;
-    my $guard = Scope::Guard->new(sub {
+    my $guard = make_guard(sub {
         unlink $sockfn;
     });
 

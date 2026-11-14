@@ -1,6 +1,6 @@
 use strict;
 use warnings;
-use Net::EmptyPort qw(check_port empty_port);
+use Net::EmptyPort qw(check_port);
 use Test::More;
 use URI::Escape;
 use t::Util;
@@ -26,13 +26,8 @@ my $quic_port = empty_port({
 });
 my $h3client = bindir() . "/h2o-httpclient";
 
-subtest 'forward' => sub {
-    subtest '100 Continue' => sub {
-        do_forward(100);
-    };
-    subtest '103 Early Hints' => sub {
-        do_forward(103);
-    };
+subtest 'forward 103 Early Hints' => sub {
+    do_forward(103);
 };
 
 subtest 'send 103' => sub {
@@ -74,7 +69,7 @@ EOT
                 unless -e $h3client;
             for my $sleep_secs (qw(0 2)) {
                 subtest "sleep $sleep_secs" => sub {
-                    open my $fh, "-|", "$h3client -3 100 https://127.0.0.1:$quic_port/async/sleep-and-respond?sleep=$sleep_secs 2>&1"
+                    open my $fh, "-|", "$h3client -k -3 100 https://127.0.0.1:$quic_port/async/sleep-and-respond?sleep=$sleep_secs 2>&1"
                         or die "failed to invoke $h3client:$!";
                     like scalar(<$fh>), qr{^HTTP/3 103}, "103 resp";
                     ok wait_for_line($fh, qr{^foo: FOO$}s, qr{^$}s), "has foo: FOO";
@@ -101,7 +96,7 @@ EOT
         subtest 'http/3' => sub {
             plan skip_all => "$h3client not found"
                 unless -e $h3client;
-            my $resp = `$h3client -3 100 https://127.0.0.1:$quic_port/sync/index.txt 2>&1`;
+            my $resp = `$h3client -k -3 100 https://127.0.0.1:$quic_port/sync/index.txt 2>&1`;
             like $resp, qr{^HTTP/3 200\n}s;
         };
     };
@@ -121,6 +116,70 @@ EOT
     $resp = `curl --http1.1 --silent --dump-header /dev/stdout '$url' '$url?sleep'`;
     my @m = $resp =~ m{HTTP/1.1 200 OK}g;
     is(scalar(@m), 2) or diag $resp;
+};
+
+subtest 'hop-by-hop headers are not forwarded' => sub {
+    my $server = spawn_h2o(<< "EOT");
+send-informational: all
+hosts:
+  default:
+    paths:
+      /:
+        proxy.reverse.url: http://127.0.0.1:$upstream_port
+EOT
+    run_with_curl($server, sub {
+        my ($proto, $port, $curl) = @_;
+        my $resp = `$curl --silent --dump-header /dev/stdout '$proto://127.0.0.1:$port/1xx?status=103&link=1&hop-by-hop=1'`;
+        my ($info, $final) = split(/\r\n\r\n/, $resp, 2);
+        like $info, qr{^HTTP/[\d.]+ 103}mi, "103 forwarded";
+        like $info, qr{^link: </index.js>; rel=preload}mi, "link forwarded";
+        unlike $info, qr{^(?:connection|keep-alive):}mi, "hop-by-hop headers dropped";
+        like $final, qr{^HTTP/[\d.]+ 200}mi, "final response";
+        like $final, qr{\r\n\r\nhello world$}s, "response body";
+    });
+};
+
+subtest 'expect is forwarded on paths sending early hints' => sub {
+    my $server = spawn_h2o(<< "EOT");
+hosts:
+  default:
+    paths:
+      /:
+        proxy.expect: FORWARD
+        proxy.reverse.url: http://127.0.0.1:$upstream_port
+        header.add:
+          header:
+            - "foo: FOO"
+          when: early
+EOT
+    my $resp = `curl --silent -H 'expect: 100-continue' --data-binary hello http://127.0.0.1:$server->{port}/echo-headers`;
+    like $resp, qr{^expect: 100-continue$}m;
+};
+
+subtest 'http2 upstream' => sub {
+    my $backend = spawn_h2o(<< "EOT");
+send-informational: all
+hosts:
+  default:
+    paths:
+      /:
+        proxy.reverse.url: http://127.0.0.1:$upstream_port
+EOT
+    my $server = spawn_h2o(<< "EOT");
+send-informational: all
+hosts:
+  default:
+    paths:
+      /:
+        proxy.reverse.url: https://127.0.0.1:$backend->{tls_port}
+        proxy.http2.ratio: 100
+        proxy.ssl.verify-peer: OFF
+EOT
+    my $resp = `curl --http1.1 --silent --dump-header /dev/stdout 'http://127.0.0.1:$server->{port}/1xx?status=103&link=1'`;
+    like $resp, qr{^HTTP/1.1 103 .*?\r\nlink: </index.js>}s, "103 forwarded";
+    my ($final) = $resp =~ m{^(HTTP/1.1 200 .*?)\r\n\r\n}ms;
+    ok defined $final, "final response" or diag $resp;
+    unlike $final, qr{^link:}mi, "headers of 103 not included in final response";
 };
 
 done_testing();
@@ -191,14 +250,14 @@ EOT
         run_with_curl($server, sub {
             my ($proto, $port, $curl) = @_;
             my $resp = `$curl --silent --dump-header /dev/stdout '$proto://127.0.0.1:$port/1xx?status=$status&link=$link'`;
-            if ($curl =~ /http2/) {
+            if ($curl =~ /--http[23]/) {
                 like $resp, qr{^HTTP/[\d.]+ $status}mi;
             } else {
                 unlike $resp, qr{^HTTP/[\d.]+ $status}mi;
             }
         });
     };
-    
+
     subtest 'none' => sub {
         my $server = spawn_h2o(<< "EOT");
 send-informational: none

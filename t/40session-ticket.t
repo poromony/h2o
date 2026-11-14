@@ -1,8 +1,7 @@
 use strict;
 use warnings;
 use File::Temp qw(tempdir);
-use IPC::Open2;
-use Net::EmptyPort qw(check_port empty_port);
+use Net::EmptyPort qw(check_port);
 use Test::More;
 use Time::HiRes qw(sleep);
 use t::Util;
@@ -111,13 +110,12 @@ EOT
     $doit->("ascii");
 };
 
-done_testing;
-
 my $server;
 
 sub spawn_with {
     my ($opts, $cb) = @_;
-    $server = spawn_h2o(<< "EOT");
+    # FIXME server stalls if H3 is enabled and ticket encryption key cannot be read from file?
+    $server = spawn_h2o({conf => << "EOT", disable_quic => 1});
 ssl-session-resumption:
 $opts
 hosts:
@@ -130,14 +128,13 @@ EOT
 }
 
 sub test {
-    my $lines = do {
-        my $cmd_opts = (-e "$tempdir/session" ? "-sess_in $tempdir/session" : "") . " -sess_out $tempdir/session";
-        open2(my $outfh, my $infh, "timeout 1 openssl s_client $cmd_opts -connect 127.0.0.1:$server->{tls_port} 2>&1")
-            or die "failed to open pipe:$!";
-        local $/;
-        <$outfh>;
-    };
+    my $cmd_opts = (-e "$tempdir/session" ? "-sess_in $tempdir/session" : "") . " -sess_out $tempdir/session";
+    my $lines = run_openssl_client({ host => "127.0.0.1", port => $server->{tls_port}, opts => "$cmd_opts" });
     $lines =~ m{---\n(New|Reused),}s
         or die "failed to parse the output of s_client:{{{$lines}}}";
     $1;
 }
+
+undef $server;
+
+done_testing;

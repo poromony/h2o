@@ -53,7 +53,8 @@ static int secp256r1_on_exchange(ptls_key_exchange_context_t **_ctx, int release
         goto Exit;
     }
 
-    if (peerkey.len != SECP256R1_PUBLIC_KEY_SIZE || peerkey.base[0] != TYPE_UNCOMPRESSED_PUBLIC_KEY) {
+    if (peerkey.len != SECP256R1_PUBLIC_KEY_SIZE || peerkey.base[0] != TYPE_UNCOMPRESSED_PUBLIC_KEY ||
+        !uECC_valid_public_key(peerkey.base + 1, uECC_secp256r1())) {
         ret = PTLS_ALERT_DECRYPT_ERROR;
         goto Exit;
     }
@@ -87,6 +88,9 @@ static int secp256r1_create_key_exchange(ptls_key_exchange_algorithm_t *algo, pt
         return PTLS_ERROR_NO_MEMORY;
     ctx->super = (ptls_key_exchange_context_t){algo, ptls_iovec_init(ctx->pub, sizeof(ctx->pub)), secp256r1_on_exchange};
     ctx->pub[0] = TYPE_UNCOMPRESSED_PUBLIC_KEY;
+
+    /* RNG function must be set before calling uECC_make_key() */
+    assert(uECC_get_rng() != NULL);
     uECC_make_key(ctx->pub + 1, ctx->priv, uECC_secp256r1());
 
     *_ctx = &ctx->super;
@@ -99,7 +103,8 @@ static int secp256r1_key_exchange(ptls_key_exchange_algorithm_t *algo, ptls_iove
     uint8_t priv[SECP256R1_PRIVATE_KEY_SIZE], *pub = NULL, *secbytes = NULL;
     int ret;
 
-    if (peerkey.len != SECP256R1_PUBLIC_KEY_SIZE || peerkey.base[0] != TYPE_UNCOMPRESSED_PUBLIC_KEY) {
+    if (peerkey.len != SECP256R1_PUBLIC_KEY_SIZE || peerkey.base[0] != TYPE_UNCOMPRESSED_PUBLIC_KEY ||
+        !uECC_valid_public_key(peerkey.base + 1, uECC_secp256r1())) {
         ret = PTLS_ALERT_DECRYPT_ERROR;
         goto Exit;
     }
@@ -131,8 +136,8 @@ Exit:
     return ret;
 }
 
-static int secp256r1sha256_sign(ptls_sign_certificate_t *_self, ptls_t *tls, uint16_t *selected_algorithm, ptls_buffer_t *outbuf,
-                                ptls_iovec_t input, const uint16_t *algorithms, size_t num_algorithms)
+static int secp256r1sha256_sign(ptls_sign_certificate_t *_self, ptls_t *tls, ptls_async_job_t **async, uint16_t *selected_algorithm,
+                                ptls_buffer_t *outbuf, ptls_iovec_t input, const uint16_t *algorithms, size_t num_algorithms)
 {
     ptls_minicrypto_secp256r1sha256_sign_certificate_t *self = (ptls_minicrypto_secp256r1sha256_sign_certificate_t *)_self;
     uint8_t hash[32], sig[64];

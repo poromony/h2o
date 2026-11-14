@@ -38,8 +38,15 @@ typedef struct st_h2o_http3_server_ctx_t {
     h2o_http3_qpack_context_t qpack;
 } h2o_http3_server_ctx_t;
 
-extern const h2o_protocol_callbacks_t H2O_HTTP3_SERVER_CALLBACKS;
 extern const h2o_http3_conn_callbacks_t H2O_HTTP3_CONN_CALLBACKS;
+
+/**
+ * initializes the context
+ */
+void h2o_http3_server_init_context(h2o_context_t *h2o, h2o_quic_ctx_t *ctx, h2o_loop_t *loop, h2o_socket_t *sock,
+                                   h2o_socket_t *sock_alt_family, quicly_context_t *quic, quicly_cid_plaintext_t *next_cid,
+                                   h2o_quic_accept_cb acceptor, h2o_quic_notify_connection_update_cb notify_conn_update,
+                                   uint8_t use_gso);
 
 /**
  * the acceptor callback to be used together with h2o_http3_server_ctx_t
@@ -47,11 +54,16 @@ extern const h2o_http3_conn_callbacks_t H2O_HTTP3_CONN_CALLBACKS;
  */
 h2o_http3_conn_t *h2o_http3_server_accept(h2o_http3_server_ctx_t *ctx, quicly_address_t *destaddr, quicly_address_t *srcaddr,
                                           quicly_decoded_packet_t *packet, quicly_address_token_plaintext_t *address_token,
-                                          int skip_tracing, const h2o_http3_conn_callbacks_t *h3_callbacks);
+                                          const h2o_http3_conn_callbacks_t *h3_callbacks);
 /**
  * amends the quicly context so that it could be used for the server
  */
 void h2o_http3_server_amend_quicly_context(h2o_globalconf_t *conf, quicly_context_t *quic);
+/**
+ * Given a QUIC connection context, returns the application-level connection context. Caller must not supply QUIC connections used
+ * for other purposes than serving HTTP response (e.g., that created by http3client).
+ */
+h2o_conn_t *h2o_http3_get_connection(quicly_conn_t *quic);
 
 #ifdef __cplusplus
 }

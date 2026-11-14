@@ -69,12 +69,13 @@ static void requests_status_per_thread(void *priv, h2o_context_t *ctx)
         return;
 
     h2o_buffer_init(&cbdata.buffer, &h2o_socket_buffer_prototype);
-    if (ctx->globalconf->http1.callbacks.foreach_request(ctx, collect_req_status, &cbdata) != 0 ||
-        ctx->globalconf->http2.callbacks.foreach_request(ctx, collect_req_status, &cbdata) != 0 ||
-        ctx->globalconf->http3.callbacks.foreach_request(ctx, collect_req_status, &cbdata) != 0) {
-        h2o_buffer_dispose(&cbdata.buffer);
-        return;
-    }
+
+    H2O_CONN_LIST_FOREACH(h2o_conn_t * conn, ({&ctx->_conns.active, &ctx->_conns.idle, &ctx->_conns.shutdown}), {
+        if (conn->callbacks->foreach_request(conn, collect_req_status, &cbdata) != 0) {
+            h2o_buffer_dispose(&cbdata.buffer);
+            return;
+        }
+    });
 
     /* concat JSON elements */
     if (cbdata.buffer->size != 0) {
@@ -148,8 +149,9 @@ static h2o_iovec_t requests_status_final(void *priv, h2o_globalconf_t *gconf, h2
     struct st_requests_status_ctx_t *rsc = priv;
 
     if (rsc->logconf != NULL) {
-        ret = h2o_concat(&req->pool, h2o_iovec_init(H2O_STRLIT(",\n \"requests\": [")), rsc->req_data,
-                         h2o_iovec_init(H2O_STRLIT("\n ]")));
+        if (req != NULL)
+            ret = h2o_concat(&req->pool, h2o_iovec_init(H2O_STRLIT(",\n \"requests\": [")), rsc->req_data,
+                             h2o_iovec_init(H2O_STRLIT("\n ]")));
         h2o_logconf_dispose(rsc->logconf);
     }
     free(rsc->req_data.base);

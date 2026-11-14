@@ -33,6 +33,8 @@ extern "C" {
 
 #define H2O_STRLIT(s) (s), sizeof(s) - 1
 
+#define H2O_INT8_LONGEST_STR "-127"
+#define H2O_UINT8_LONGEST_STR "255"
 #define H2O_INT16_LONGEST_STR "-32768"
 #define H2O_UINT16_LONGEST_STR "65535"
 #define H2O_INT32_LONGEST_STR "-2147483648"
@@ -115,9 +117,19 @@ int h2o_hex_decode(void *dst, const char *src, size_t src_len);
  */
 void h2o_hex_encode(char *dst, const void *src, size_t src_len);
 /**
- * URI-ecsapes given string (as defined in RFC 3986)
+ * URI-escapes given string (as defined in RFC 3986)
+ * @param pool memory pool or NULL to allocate memory using malloc
+ * @return an encoded string which is NULL-terminated (NULL does not count as part of `.len`)
  */
 h2o_iovec_t h2o_uri_escape(h2o_mem_pool_t *pool, const char *s, size_t l, const char *preserve_chars);
+/**
+ * decodes a percent-encoded string (RFC 3986 Section 2.1)
+ * @param pool memory pool or NULL to allocate memory using malloc
+ * @param s source string
+ * @param l length of source string
+ * @return a decoded string which is NULL-terminated (NULL does not count as part of `.len`), or {NULL, 0} if failed
+ */
+h2o_iovec_t h2o_uri_unescape(h2o_mem_pool_t *pool, const char *s, size_t l);
 /**
  * returns the extension portion of path
  */
@@ -177,6 +189,15 @@ void h2o_split(h2o_mem_pool_t *pool, h2o_iovec_vector_t *list, h2o_iovec_t str, 
 int h2o_str_at_position(char *buf, const char *src, size_t src_len, int lineno, int column);
 
 int h2o__lcstris_core(const char *target, const char *test, size_t test_len);
+
+/**
+ * Encode a Structured Field Value [RFC 8941] of type String ("sf-string" in the RFC)
+ * @param pool memory pool (or NULL to use malloc)
+ * @param s source string
+ * @param slen length of source string; if slen==SIZE_MAX, then strlen(s) will be used
+ * @return buffer pointing to the encoded string (buf is NUL-terminated but the length does not include the NUL char)
+ */
+h2o_iovec_t h2o_encode_sf_string(h2o_mem_pool_t *pool, const char *s, size_t slen);
 
 /* inline defs */
 

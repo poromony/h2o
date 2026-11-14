@@ -28,60 +28,92 @@
 #define DEFAULT_MAX_CRYPTO_BYTES 65536
 #define DEFAULT_INITCWND_PACKETS 10
 #define DEFAULT_PRE_VALIDATION_AMPLIFICATION_LIMIT 3
+#define DEFAULT_HANDSHAKE_TIMEOUT_RTT_MULTIPLIER 400
+#define DEFAULT_MAX_INITIAL_HANDSHAKE_PACKETS 1000
+#define DEFAULT_MAX_PROBE_PACKETS 5
+#define DEFAULT_MAX_PATH_VALIDATION_FAILURES 100
 
 /* profile that employs IETF specified values */
-const quicly_context_t quicly_spec_context = {NULL,                                                 /* tls */
-                                              DEFAULT_INITIAL_EGRESS_MAX_UDP_PAYLOAD_SIZE,          /* client_initial_size */
-                                              QUICLY_LOSS_SPEC_CONF,                                /* loss */
-                                              {{1 * 1024 * 1024, 1 * 1024 * 1024, 1 * 1024 * 1024}, /* max_stream_data */
-                                               16 * 1024 * 1024,                                    /* max_data */
-                                               30 * 1000,                                           /* idle_timeout (30 seconds) */
-                                               100, /* max_concurrent_streams_bidi */
-                                               0,   /* max_concurrent_streams_uni */
-                                               DEFAULT_MAX_UDP_PAYLOAD_SIZE},
-                                              DEFAULT_MAX_PACKETS_PER_KEY,
-                                              DEFAULT_MAX_CRYPTO_BYTES,
-                                              DEFAULT_INITCWND_PACKETS,
-                                              QUICLY_PROTOCOL_VERSION_1,
-                                              DEFAULT_PRE_VALIDATION_AMPLIFICATION_LIMIT,
-                                              0, /* enlarge_client_hello */
-                                              NULL,
-                                              NULL, /* on_stream_open */
-                                              &quicly_default_stream_scheduler,
-                                              NULL, /* receive_datagram_frame */
-                                              NULL, /* on_conn_close */
-                                              &quicly_default_now,
-                                              NULL,
-                                              NULL,
-                                              &quicly_default_crypto_engine,
-                                              &quicly_default_init_cc};
+const quicly_context_t quicly_spec_context = {
+    .initial_egress_max_udp_payload_size = DEFAULT_INITIAL_EGRESS_MAX_UDP_PAYLOAD_SIZE,
+    .transport_params =
+        {
+            .max_stream_data.bidi_local = 1 * 1024 * 1024,
+            .max_stream_data.bidi_remote = 11 * 1024 * 1024,
+            .max_stream_data.uni = 1 * 1024 * 1024,
+            .max_data = 16 * 1024 * 1024,
+            .max_idle_timeout = 30 * 1000,
+            .max_streams_bidi = 100,
+            .max_streams_uni = 0,
+            .max_udp_payload_size = DEFAULT_MAX_UDP_PAYLOAD_SIZE,
+        },
+    .max_packets_per_key = DEFAULT_MAX_PACKETS_PER_KEY,
+    .max_crypto_bytes = DEFAULT_MAX_CRYPTO_BYTES,
+    .initial_version = QUICLY_PROTOCOL_VERSION_1,
+    .pre_validation_amplification_limit = DEFAULT_PRE_VALIDATION_AMPLIFICATION_LIMIT,
+    .handshake_timeout_rtt_multiplier = DEFAULT_HANDSHAKE_TIMEOUT_RTT_MULTIPLIER,
+    .max_initial_handshake_packets = DEFAULT_MAX_INITIAL_HANDSHAKE_PACKETS,
+    .max_probe_packets = DEFAULT_MAX_PROBE_PACKETS,
+    .max_path_validation_failures = DEFAULT_MAX_PATH_VALIDATION_FAILURES,
+    .stream_scheduler = &quicly_default_stream_scheduler,
+    .now = &quicly_default_now,
+    .crypto_engine = &quicly_default_crypto_engine,
+    .egress[0] =
+        {
+            .loss = QUICLY_LOSS_SPEC_CONF,
+            .cc =
+                {
+                    .init_cc = &quicly_default_init_cc,
+                    .initcwnd_packets = DEFAULT_INITCWND_PACKETS,
+                    .normalize_mtu = 1,
+                },
+            .pacing_multiplier = QUICLY_DEFAULT_PACING_MULTIPLIER,
+            .pacing_multiplier_l4s = QUICLY_DEFAULT_PACING_MULTIPLIER_L4S,
+            .ecn = QUICLY_ECN_MODE_CLASSIC,
+            .respect_app_limited = 1,
+        },
+};
 
 /* profile with a focus on reducing latency for the HTTP use case */
-const quicly_context_t quicly_performant_context = {NULL,                                                 /* tls */
-                                                    DEFAULT_INITIAL_EGRESS_MAX_UDP_PAYLOAD_SIZE,          /* client_initial_size */
-                                                    QUICLY_LOSS_PERFORMANT_CONF,                          /* loss */
-                                                    {{1 * 1024 * 1024, 1 * 1024 * 1024, 1 * 1024 * 1024}, /* max_stream_data */
-                                                     16 * 1024 * 1024,                                    /* max_data */
-                                                     30 * 1000, /* idle_timeout (30 seconds) */
-                                                     100,       /* max_concurrent_streams_bidi */
-                                                     0,         /* max_concurrent_streams_uni */
-                                                     DEFAULT_MAX_UDP_PAYLOAD_SIZE},
-                                                    DEFAULT_MAX_PACKETS_PER_KEY,
-                                                    DEFAULT_MAX_CRYPTO_BYTES,
-                                                    DEFAULT_INITCWND_PACKETS,
-                                                    QUICLY_PROTOCOL_VERSION_1,
-                                                    DEFAULT_PRE_VALIDATION_AMPLIFICATION_LIMIT,
-                                                    0, /* enlarge_client_hello */
-                                                    NULL,
-                                                    NULL, /* on_stream_open */
-                                                    &quicly_default_stream_scheduler,
-                                                    NULL, /* receive_datagram_frame */
-                                                    NULL, /* on_conn_close */
-                                                    &quicly_default_now,
-                                                    NULL,
-                                                    NULL,
-                                                    &quicly_default_crypto_engine,
-                                                    &quicly_default_init_cc};
+const quicly_context_t quicly_performant_context = {
+    .initial_egress_max_udp_payload_size = DEFAULT_INITIAL_EGRESS_MAX_UDP_PAYLOAD_SIZE,
+    .transport_params =
+        {
+            .max_stream_data.bidi_local = 1 * 1024 * 1024,
+            .max_stream_data.bidi_remote = 11 * 1024 * 1024,
+            .max_stream_data.uni = 1 * 1024 * 1024,
+            .max_data = 16 * 1024 * 1024,
+            .max_idle_timeout = 30 * 1000,
+            .max_streams_bidi = 100,
+            .max_streams_uni = 0,
+            .max_udp_payload_size = DEFAULT_MAX_UDP_PAYLOAD_SIZE,
+        },
+    .max_packets_per_key = DEFAULT_MAX_PACKETS_PER_KEY,
+    .max_crypto_bytes = DEFAULT_MAX_CRYPTO_BYTES,
+    .initial_version = QUICLY_PROTOCOL_VERSION_1,
+    .pre_validation_amplification_limit = DEFAULT_PRE_VALIDATION_AMPLIFICATION_LIMIT,
+    .handshake_timeout_rtt_multiplier = DEFAULT_HANDSHAKE_TIMEOUT_RTT_MULTIPLIER,
+    .max_initial_handshake_packets = DEFAULT_MAX_INITIAL_HANDSHAKE_PACKETS,
+    .max_probe_packets = DEFAULT_MAX_PROBE_PACKETS,
+    .max_path_validation_failures = DEFAULT_MAX_PATH_VALIDATION_FAILURES,
+    .stream_scheduler = &quicly_default_stream_scheduler,
+    .now = &quicly_default_now,
+    .crypto_engine = &quicly_default_crypto_engine,
+    .egress[0] =
+        {
+            .loss = QUICLY_LOSS_PERFORMANT_CONF,
+            .cc =
+                {
+                    .init_cc = &quicly_default_init_cc,
+                    .initcwnd_packets = DEFAULT_INITCWND_PACKETS,
+                    .normalize_mtu = 1,
+                },
+            .pacing_multiplier = QUICLY_DEFAULT_PACING_MULTIPLIER,
+            .pacing_multiplier_l4s = QUICLY_DEFAULT_PACING_MULTIPLIER_L4S,
+            .ecn = QUICLY_ECN_MODE_CLASSIC,
+            .respect_app_limited = 1,
+        },
+};
 
 /**
  * The context of the default CID encryptor.  All the contexts being used here are ECB ciphers and therefore stateless - they can be
@@ -186,14 +218,15 @@ quicly_cid_encryptor_t *quicly_new_default_cid_encryptor(ptls_cipher_algorithm_t
                                                          ptls_cipher_algorithm_t *reset_token_cipher, ptls_hash_algorithm_t *hash,
                                                          ptls_iovec_t key)
 {
-    struct st_quicly_default_encrypt_cid_t *self;
+    struct st_quicly_default_encrypt_cid_t *self = NULL;
     uint8_t digestbuf[PTLS_MAX_DIGEST_SIZE], keybuf[PTLS_MAX_SECRET_SIZE];
 
     assert(cid_cipher->block_size == 8 || cid_cipher->block_size == 16);
     assert(reset_token_cipher->block_size == 16);
 
     if (key.len > hash->block_size) {
-        ptls_calc_hash(hash, digestbuf, key.base, key.len);
+        if (ptls_calc_hash(hash, digestbuf, key.base, key.len) != 0)
+            goto Fail;
         key = ptls_iovec_init(digestbuf, hash->digest_size);
     }
 
@@ -285,10 +318,12 @@ static void link_stream(struct st_quicly_default_scheduler_state_t *sched, quicl
 /**
  * See doc-comment of `st_quicly_default_scheduler_state_t` to understand the logic.
  */
-static int default_stream_scheduler_do_send(quicly_stream_scheduler_t *self, quicly_conn_t *conn, quicly_send_context_t *s)
+static quicly_error_t default_stream_scheduler_do_send(quicly_stream_scheduler_t *self, quicly_conn_t *conn,
+                                                       quicly_send_context_t *s)
 {
     struct st_quicly_default_scheduler_state_t *sched = &((struct _st_quicly_conn_public_t *)conn)->_default_scheduler;
-    int conn_is_blocked = quicly_is_blocked(conn), ret = 0;
+    int conn_is_blocked = quicly_is_blocked(conn);
+    quicly_error_t ret = 0;
 
     if (!conn_is_blocked)
         quicly_linklist_insert_list(&sched->active, &sched->blocked);
@@ -305,7 +340,7 @@ static int default_stream_scheduler_do_send(quicly_stream_scheduler_t *self, qui
         }
         /* send! */
         if ((ret = quicly_send_stream(stream, s)) != 0) {
-            /* FIXME Stop quicly_send_stream emitting SENDBUF_FULL (happpens when CWND is congested). Otherwise, we need to make
+            /* FIXME Stop quicly_send_stream emitting SENDBUF_FULL (happens when CWND is congested). Otherwise, we need to make
              * adjustments to the scheduler after popping a stream */
             if (ret == QUICLY_ERROR_SENDBUF_FULL) {
                 assert(quicly_stream_can_send(stream, 1));
@@ -325,7 +360,7 @@ static int default_stream_scheduler_do_send(quicly_stream_scheduler_t *self, qui
 /**
  * See doc-comment of `st_quicly_default_scheduler_state_t` to understand the logic.
  */
-static int default_stream_scheduler_update_state(quicly_stream_scheduler_t *self, quicly_stream_t *stream)
+static void default_stream_scheduler_update_state(quicly_stream_scheduler_t *self, quicly_stream_t *stream)
 {
     struct st_quicly_default_scheduler_state_t *sched = &((struct _st_quicly_conn_public_t *)stream->conn)->_default_scheduler;
 
@@ -333,12 +368,10 @@ static int default_stream_scheduler_update_state(quicly_stream_scheduler_t *self
         /* activate if not */
         link_stream(sched, stream, quicly_is_blocked(stream->conn));
     } else {
-        /* disactivate if active */
+        /* deactivate if active */
         if (quicly_linklist_is_linked(&stream->_send_aux.pending_link.default_scheduler))
             quicly_linklist_unlink(&stream->_send_aux.pending_link.default_scheduler);
     }
-
-    return 0;
 }
 
 quicly_stream_scheduler_t quicly_default_stream_scheduler = {default_stream_scheduler_can_send, default_stream_scheduler_do_send,
@@ -354,17 +387,17 @@ void quicly_default_free_stream(quicly_stream_t *stream)
     free(stream);
 }
 
-static int64_t default_now(quicly_now_t *self)
+static void default_now(quicly_now_t *self, double *value)
 {
     struct timeval tv;
     gettimeofday(&tv, NULL);
-    int64_t tv_now = (int64_t)tv.tv_sec * 1000 + tv.tv_usec / 1000;
+    double tv_now = (double)tv.tv_sec * 1000 + tv.tv_usec / 1000.;
 
     /* make sure that the time does not get rewind */
-    static __thread int64_t now;
+    static __thread double now;
     if (now < tv_now)
         now = tv_now;
-    return now;
+    *value = now;
 }
 
 quicly_now_t quicly_default_now = {default_now};
@@ -395,13 +428,6 @@ static int default_setup_cipher(quicly_crypto_engine_t *engine, quicly_conn_t *c
     if ((*aead_ctx = ptls_aead_new(aead, hash, is_enc, secret, QUICLY_AEAD_BASE_LABEL)) == NULL) {
         ret = PTLS_ERROR_NO_MEMORY;
         goto Exit;
-    }
-    if (QUICLY_DEBUG) {
-        char *secret_hex = quicly_hexdump(secret, hash->digest_size, SIZE_MAX),
-             *hpkey_hex = quicly_hexdump(hpkey, aead->ctr_cipher->key_size, SIZE_MAX);
-        fprintf(stderr, "%s:\n  aead-secret: %s\n  hp-key: %s\n", __FUNCTION__, secret_hex, hpkey_hex);
-        free(secret_hex);
-        free(hpkey_hex);
     }
 
     ret = 0;

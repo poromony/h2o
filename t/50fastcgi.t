@@ -2,7 +2,7 @@ use strict;
 use warnings;
 use Digest::MD5 qw(md5_hex);
 use File::Temp qw(tempdir);
-use Net::EmptyPort qw(check_port empty_port);
+use Net::EmptyPort qw(check_port);
 use Test::More;
 use t::Util;
 
@@ -74,6 +74,15 @@ EOT
                     unlike $content, qr/^https: on$/m;
                 }
             });
+        };
+        subtest 'response-header-size' => sub {
+            my $doit = sub {
+                my ($len, $expected_status) = @_;
+                my $resp = `curl --silent --show-error --dump-header /dev/stdout -X POST --data-binary '[200, ["x-long" => "a" x $len], ["hello"]]' http://127.0.0.1:$server->{port}/custom-perl`;
+                like $resp, qr{^HTTP/[^ ]* $expected_status}s, "$len bytes";
+            };
+            $doit->(100000, 200);
+            $doit->(1000000, 503);
         };
         subtest 'cookie-merge' => sub {
             plan skip_all => "curl does not support HTTP/2"

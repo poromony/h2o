@@ -24,6 +24,12 @@
     <ClCompile Include="..\..\t\openssl.c">
       <Filter>Header Files</Filter>
     </ClCompile>
+    <ClCompile Include="..\..\t\hpke.c">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="..\..\t\quiclb.c">
+      <Filter>Source Files</Filter>
+    </ClCompile>
   </ItemGroup>
   <ItemGroup>
     <None Include="..\..\deps\cifra\src\testnorx.katdata.inc">

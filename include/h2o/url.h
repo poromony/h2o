@@ -32,7 +32,12 @@ typedef struct st_h2o_url_scheme_t {
     int is_ssl;
 } h2o_url_scheme_t;
 
-extern const h2o_url_scheme_t H2O_URL_SCHEME_HTTP, H2O_URL_SCHEME_HTTPS, H2O_URL_SCHEME_FASTCGI;
+extern const h2o_url_scheme_t H2O_URL_SCHEME_HTTP, H2O_URL_SCHEME_HTTPS;
+extern const h2o_url_scheme_t H2O_URL_SCHEME_MASQUE;
+/**
+ * used by fastcgi handler
+ */
+extern const h2o_url_scheme_t H2O_URL_SCHEME_FASTCGI;
 
 typedef struct st_h2o_url_t {
     const h2o_url_scheme_t *scheme;
@@ -52,10 +57,12 @@ static uint16_t h2o_url_get_port(const h2o_url_t *url);
  * @param path source path
  * @param len source length
  * @param returns offset of '?' within `path` if found, or SIZE_MAX if not
- * @param indexes mapping the normalized version to the input version
+ * @param norm_indexes mapping the normalized version to the input version
+ * @param null_char_found if a NULL character was found in the normalized path being returned
  * @return buffer pointing to source, or buffer pointing to an allocated chunk with normalized representation of the given path
  */
-h2o_iovec_t h2o_url_normalize_path(h2o_mem_pool_t *pool, const char *path, size_t len, size_t *query_at, size_t **norm_indexes);
+h2o_iovec_t h2o_url_normalize_path(h2o_mem_pool_t *pool, const char *path, size_t len, size_t *query_at, size_t **norm_indexes,
+                                   int *null_char_found);
 /**
  * initializes URL object given scheme, authority, and path
  * @param the output
@@ -72,13 +79,14 @@ int h2o_url_init_with_sun_path(h2o_url_t *url, h2o_mem_pool_t *pool, const h2o_u
                                h2o_iovec_t path);
 
 /**
- * parses absolute URL (either http or https)
+ * Parses absolute URL (either http or https). Upon successful return, `path` attribute of the returned object is guaranteed to be
+ * in absolute form (i.e., starts with `/`) so that it can be passed directly to HTTP clients.
  */
-int h2o_url_parse(const char *url, size_t url_len, h2o_url_t *result);
+int h2o_url_parse(h2o_mem_pool_t *pool, const char *url, size_t url_len, h2o_url_t *result);
 /**
  * parses relative URL
  */
-int h2o_url_parse_relative(const char *url, size_t url_len, h2o_url_t *result);
+int h2o_url_parse_relative(h2o_mem_pool_t *pool, const char *url, size_t url_len, h2o_url_t *result);
 /**
  * parses the authority and returns the next position (i.e. start of path)
  * @return pointer to the end of hostport if successful, or NULL if failed.  *port becomes the specified port number or 65535 if not

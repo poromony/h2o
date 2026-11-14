@@ -53,7 +53,7 @@ static int on_config_expires(h2o_configurator_command_t *cmd, h2o_configurator_c
         } else if (strncasecmp(unit, H2O_STRLIT("month")) == 0) {
             value *= 30 * 24 * 60 * 60;
         } else if (strncasecmp(unit, H2O_STRLIT("year")) == 0) {
-            value *= 365 * 30 * 24 * 60 * 60;
+            value *= 365 * 24 * 60 * 60;
         } else {
             /* TODO add support for H2O_EXPIRES_MODE_MAX_ABSOLUTE that sets the Expires header? */
             h2o_configurator_errprintf(cmd, node, "unknown unit:`%s` (see --help)", unit);
@@ -95,9 +95,8 @@ static int on_config_exit(h2o_configurator_t *_self, h2o_configurator_context_t 
 
     if (*self->args != NULL) {
         /* setup */
-        if (ctx->pathconf != NULL) {
+        if (ctx->pathconf != NULL && !h2o_configurator_at_extension_level(ctx))
             h2o_expires_register(ctx->pathconf, *self->args);
-        }
         /* destruct */
         assert((*self->args)->mode == H2O_EXPIRES_MODE_MAX_AGE);
         free(*self->args);
@@ -118,6 +117,8 @@ void h2o_expires_register_configurator(h2o_globalconf_t *conf)
     /* setup handlers */
     c->super.enter = on_config_enter;
     c->super.exit = on_config_exit;
-    h2o_configurator_define_command(&c->super, "expires", H2O_CONFIGURATOR_FLAG_ALL_LEVELS | H2O_CONFIGURATOR_FLAG_EXPECT_SCALAR,
+    h2o_configurator_define_command(&c->super, "expires",
+                                    H2O_CONFIGURATOR_FLAG_GLOBAL | H2O_CONFIGURATOR_FLAG_HOST | H2O_CONFIGURATOR_FLAG_PATH |
+                                        H2O_CONFIGURATOR_FLAG_EXPECT_SCALAR,
                                     on_config_expires);
 }

@@ -2,7 +2,7 @@ use strict;
 use warnings;
 use Digest::MD5 qw(md5_hex);
 use File::Temp qw(tempdir);
-use Net::EmptyPort qw(empty_port wait_port);
+use Net::EmptyPort qw(wait_port);
 use POSIX ":sys_wait_h";
 use Test::More;
 use t::Util;
@@ -59,7 +59,8 @@ die "fork failed:$!"
 	unless defined $client_pid;
 
 if ($client_pid == 0) {
-	my @args = ("$client_prog", qw(-3 100 -t 5 -d 1000 -b 10 -c 2 -i 1000), "https://127.0.0.1:$quic_port/echo");
+	open STDOUT, ">", "/dev/null" or die "failed to redirect stdout:$!";
+	my @args = ("$client_prog", qw(-k -3 100 -t 5 -d 1000 -b 10 -c 2 -i 1000), "https://127.0.0.1:$quic_port/echo");
 	exec @args;
 	die "should not reach here!";
 }

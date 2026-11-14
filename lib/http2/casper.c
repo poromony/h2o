@@ -19,6 +19,9 @@
  * FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS
  * IN THE SOFTWARE.
  */
+#ifndef H2O_NO_OPENSSL_SUPPRESS_DEPRECATED
+#define OPENSSL_SUPPRESS_DEPRECATED /* casper is legacy and we do not want to pay the cost of switchng away from SHA1_* */
+#endif
 #include <openssl/sha.h>
 #include "golombset.h"
 #include "h2o/string_.h"
@@ -124,6 +127,10 @@ void h2o_http2_casper_consume_cookie(h2o_http2_casper_t *casper, const char *coo
         keys = h2o_mem_alloc(capacity * sizeof(*keys));
     }
 
+    /* drop the keys that `calc_key` never generates (the decoded keys are sorted in ascending order) */
+    while (num_keys != 0 && keys[num_keys - 1] >= (uint64_t)1 << casper->capacity_bits)
+        --num_keys;
+
     /* copy or merge the entries */
     if (num_keys == 0) {
         /* nothing to do */
@@ -157,6 +164,8 @@ void h2o_http2_casper_consume_cookie(h2o_http2_casper_t *casper, const char *coo
             } while (new_index != num_keys);
         }
         free(orig_keys);
+        free(casper->cookie_cache.base);
+        casper->cookie_cache = (h2o_iovec_t){NULL};
     }
 
 Exit:

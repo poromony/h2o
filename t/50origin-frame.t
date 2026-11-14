@@ -1,6 +1,6 @@
 use strict;
 use warnings;
-use Net::EmptyPort qw(check_port empty_port);
+use Net::EmptyPort qw(check_port);
 use Test::More;
 use Time::HiRes;
 use t::Util;
@@ -54,6 +54,6 @@ EOR
 
 test_origin_frame('', '');
 test_origin_frame('http2-origin-frame: [ ]', "0\n\"\"");
-test_origin_frame('http2-origin-frame: [ "https://a.localhost.examp1e.net" ]', "33\n\"\\000\\037https://a.localhost.examp1e.net\"");
-test_origin_frame('http2-origin-frame: [ "https://a.localhost.examp1e.net", "https://b.localhost.examp1e.net" ]', "66\n\"\\000\\037https://a.localhost.examp1e.net\\000\\037https://b.localhost.examp1e.net\"");
+test_origin_frame('http2-origin-frame: [ "https://a.localhost.examp1e.net" ]', "33\n\"\\x00\\x1fhttps://a.localhost.examp1e.net\"");
+test_origin_frame('http2-origin-frame: [ "https://a.localhost.examp1e.net", "https://b.localhost.examp1e.net" ]', "66\n\"\\x00\\x1fhttps://a.localhost.examp1e.net\\x00\\x1fhttps://b.localhost.examp1e.net\"");
 done_testing();

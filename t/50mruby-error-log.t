@@ -2,8 +2,7 @@ use strict;
 use warnings;
 use Digest::MD5 qw(md5_hex);
 use File::Temp qw(tempdir);
-use Net::EmptyPort qw(empty_port check_port);
-use Scope::Guard qw(scope_guard);
+use Net::EmptyPort qw(check_port);
 use Test::More;
 use Test::Exception;
 use Time::HiRes;
@@ -99,8 +98,8 @@ EOT
             note $_ for @$error_logs;
             is scalar(@$access_logs), 1, 'access log count';
             isnt scalar(@$error_logs), 0, 'error log count';
-            is $access_logs->[0], '[lib/core/proxy.c] in request:/:connection failure', 'access log';
-            is $error_logs->[-1], '[lib/core/proxy.c] in request:/:connection failure', 'error log';
+            is $access_logs->[0], "[lib/core/proxy.c] in request:127.0.0.1:$port/:connection refused", 'access log';
+            is $error_logs->[-1], "[lib/core/proxy.c] in request:127.0.0.1:$port/:connection refused", 'error log';
         });
     };
 
@@ -165,9 +164,9 @@ EOT
             note $_ for @$error_logs;
             is scalar(@$access_logs), 1, 'access log count';
             isnt scalar(@$error_logs), 0, 'error log count';
-            is $access_logs->[0], '[lib/core/proxy.c] in request:/:connection failure', 'access log';
-            is $error_logs->[-1], '[lib/core/proxy.c] in request:/:connection failure', 'error log';
-            is $body, '[lib/core/proxy.c] in request:/:connection failure', 'wrapped buffer';
+            is $access_logs->[0], "[lib/core/proxy.c] in request:127.0.0.1:$port/:connection refused", 'access log';
+            is $error_logs->[-1], "[lib/core/proxy.c] in request:127.0.0.1:$port/:connection refused", 'error log';
+            is $body, "[lib/core/proxy.c] in request:127.0.0.1:$port/:connection refused", 'wrapped buffer';
         });
     };
 
@@ -198,7 +197,7 @@ EOT
                 $client->close;
                 exit 0;
             };
-            my $upstream = scope_guard(sub {
+            my $upstream = make_guard(sub {
                 kill 'TERM', $upstream_pid;
                 while (waitpid($upstream_pid, 0) != $upstream_pid) {}
             });
@@ -235,7 +234,7 @@ listen:
     ocsp-update-interval: 0
 EOT
             $server = +{ %$server, port => $port, tls_port => $tls_port };
-            ($server, $upstream);
+            ($server, $upstream, $upstream_port);
         };
 
         run_with_curl({}, sub {
@@ -243,7 +242,7 @@ EOT
             truncate $access_log_file, 0;
             truncate $error_log_file, 0;
 
-            my ($server, $upstream) = $spawner->();
+            my ($server, $upstream, $upstream_port) = $spawner->();
             my $port = $proto eq 'http' ? $server->{port} : $server->{tls_port};
 
             my ($headers, $body) = get($proto, $port, $curl, '/');
@@ -258,7 +257,7 @@ EOT
             is scalar(@$access_logs), 1, 'access log count';
             isnt scalar(@$error_logs), 0, 'error log count';
             is $access_logs->[0], '', 'access log';
-            is $error_logs->[-1], '[lib/core/proxy.c] in request:/:failed to parse the response', 'error log';
+            is $error_logs->[-1], "[lib/core/proxy.c] in request:127.0.0.1:$upstream_port/:failed to parse the response", 'error log';
 
             live_check($proto, $port, $curl);
         });

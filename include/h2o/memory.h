@@ -37,7 +37,7 @@
 extern "C" {
 #endif
 
-#define H2O_STRUCT_FROM_MEMBER(s, m, p) ((s *)((char *)(p)-offsetof(s, m)))
+#define H2O_STRUCT_FROM_MEMBER(s, m, p) ((s *)((char *)(p) - offsetof(s, m)))
 #define H2O_ALIGNOF(type) (__alignof__(type))
 
 #if __GNUC__ >= 3
@@ -54,11 +54,11 @@ extern "C" {
 #define H2O_GNUC_VERSION 0
 #endif
 
-#if __STDC_VERSION__ >= 201112L
-#define H2O_NORETURN _Noreturn
-#elif defined(__clang__) || defined(__GNUC__) && H2O_GNUC_VERSION >= 0x20500
 // noreturn was not defined before gcc 2.5
+#if defined(__clang__) || (defined(__GNUC__) && H2O_GNUC_VERSION >= 0x20500)
 #define H2O_NORETURN __attribute__((noreturn))
+#elif __STDC_VERSION__ >= 201112L
+#define H2O_NORETURN _Noreturn
 #else
 #define H2O_NORETURN
 #endif
@@ -92,10 +92,26 @@ typedef struct st_h2o_iovec_t {
     size_t len;
 } h2o_iovec_t;
 
+#define H2O_VECTOR(type)                                                                                                           \
+    struct {                                                                                                                       \
+        type *entries;                                                                                                             \
+        size_t size;                                                                                                               \
+        size_t capacity;                                                                                                           \
+    }
+
+typedef H2O_VECTOR(void) h2o_vector_t;
+typedef H2O_VECTOR(uint8_t) h2o_byte_vector_t;
+typedef H2O_VECTOR(h2o_iovec_t) h2o_iovec_vector_t;
+
+typedef struct st_h2o_mem_recycle_conf_t {
+    size_t memsize;
+    uint8_t align_bits;
+} h2o_mem_recycle_conf_t;
+
 typedef struct st_h2o_mem_recycle_t {
-    size_t max;
-    size_t cnt;
-    struct st_h2o_mem_recycle_chunk_t *_link;
+    const h2o_mem_recycle_conf_t *conf;
+    H2O_VECTOR(void *) chunks;
+    size_t low_watermark;
 } h2o_mem_recycle_t;
 
 struct st_h2o_mem_pool_shared_entry_t {
@@ -107,6 +123,7 @@ struct st_h2o_mem_pool_shared_entry_t {
 /**
  * the memory pool
  */
+union un_h2o_mem_pool_chunk_t;
 typedef struct st_h2o_mem_pool_t {
     union un_h2o_mem_pool_chunk_t *chunks;
     size_t chunk_offset;
@@ -119,7 +136,8 @@ typedef struct st_h2o_mem_pool_t {
  */
 typedef struct st_h2o_buffer_t {
     /**
-     * capacity of the buffer (or minimum initial capacity in case of a prototype (i.e. bytes == NULL))
+     * when `bytes` != NULL (and therefore `size` != 0), the capacity of the buffer, or otherwise the minimum initial capacity in
+     * case of a prototype, or the desired next capacity if not a prototype.
      */
     size_t capacity;
     /**
@@ -131,13 +149,16 @@ typedef struct st_h2o_buffer_t {
      */
     char *bytes;
     /**
-     * prototype (or NULL if the instance is part of the prototype (i.e. bytes == NULL))
+     * prototype (or NULL if the instance is part of the prototype)
      */
     h2o_buffer_prototype_t *_prototype;
     /**
-     * file descriptor (if not -1, used to store the buffer)
+     * file descriptor (if not -1, h2o_buffer_t is a memory map of the contents of this file descriptor)
      */
     int _fd;
+    /**
+     * memory used to store data
+     */
     char _buf[1];
 } h2o_buffer_t;
 
@@ -148,7 +169,6 @@ typedef struct st_h2o_buffer_mmap_settings_t {
 } h2o_buffer_mmap_settings_t;
 
 struct st_h2o_buffer_prototype_t {
-    h2o_mem_recycle_t allocator;
     h2o_buffer_t _initial_buf;
     h2o_buffer_mmap_settings_t *mmap_settings;
 };
@@ -159,23 +179,12 @@ typedef struct st_h2o_doublebuffer_t {
     size_t _bytes_inflight;
 } h2o_doublebuffer_t;
 
-#define H2O_VECTOR(type)                                                                                                           \
-    struct {                                                                                                                       \
-        type *entries;                                                                                                             \
-        size_t size;                                                                                                               \
-        size_t capacity;                                                                                                           \
-    }
-
-typedef H2O_VECTOR(void) h2o_vector_t;
-typedef H2O_VECTOR(uint8_t) h2o_byte_vector_t;
-typedef H2O_VECTOR(h2o_iovec_t) h2o_iovec_vector_t;
-
 extern void *(*volatile h2o_mem__set_secure)(void *, int, size_t);
 
 /**
- * prints an error message and aborts
+ * prints an error message and aborts. h2o_fatal can be modified by setting the function pointer it expands to, which is h2o__fatal.
  */
-H2O_NORETURN void h2o__fatal(const char *file, int line, const char *msg, ...) __attribute__((format(printf, 3, 4)));
+extern H2O_NORETURN void (*h2o__fatal)(const char *file, int line, const char *msg, ...) __attribute__((format(printf, 3, 4)));
 #ifndef h2o_fatal
 #define h2o_fatal(...) h2o__fatal(__FILE__, __LINE__, __VA_ARGS__)
 #endif
@@ -196,6 +205,10 @@ static h2o_iovec_t h2o_iovec_init(const void *base, size_t len);
  */
 H2O_RETURNS_NONNULL static void *h2o_mem_alloc(size_t sz);
 /**
+ * wrapper of posix_memalign; if alignment is zero, calls `malloc`
+ */
+H2O_RETURNS_NONNULL static void *h2o_mem_aligned_alloc(size_t alignment, size_t sz);
+/**
  * warpper of realloc; reallocs the given chunk or dies if impossible
  */
 static void *h2o_mem_realloc(void *oldp, size_t sz);
@@ -203,7 +216,7 @@ static void *h2o_mem_realloc(void *oldp, size_t sz);
 /**
  * allocates memory using the reusing allocator
  */
-void *h2o_mem_alloc_recycle(h2o_mem_recycle_t *allocator, size_t sz);
+void *h2o_mem_alloc_recycle(h2o_mem_recycle_t *allocator);
 /**
  * returns the memory to the reusing allocator
  */
@@ -211,7 +224,11 @@ void h2o_mem_free_recycle(h2o_mem_recycle_t *allocator, void *p);
 /**
  * release all the memory chunks cached in input allocator to system
  */
-void h2o_mem_clear_recycle(h2o_mem_recycle_t *allocator);
+void h2o_mem_clear_recycle(h2o_mem_recycle_t *allocator, int full);
+/**
+ *
+ */
+static int h2o_mem_recycle_is_empty(h2o_mem_recycle_t *allocator);
 
 /**
  * initializes the memory pool.
@@ -253,6 +270,14 @@ static void h2o_mem_addref_shared(void *p);
  */
 static int h2o_mem_release_shared(void *p);
 /**
+ * frees unused memory being pooled for recycling
+ */
+void h2o_buffer_clear_recycle(int full);
+/**
+ *
+ */
+int h2o_buffer_recycle_is_empty(void);
+/**
  * initialize the buffer using given prototype.
  */
 static void h2o_buffer_init(h2o_buffer_t **buffer, h2o_buffer_prototype_t *prototype);
@@ -292,6 +317,13 @@ static int h2o_buffer_try_append(h2o_buffer_t **dst, const void *src, size_t len
  * @param delta number of octets to be drained from the buffer
  */
 void h2o_buffer_consume(h2o_buffer_t **inbuf, size_t delta);
+/**
+ * throws away entire data being store in the buffer
+ * @param record_capacity if set to true, retains the current capacity of the buffer, and when memory reservation is requested the
+ *                        next time, allocates memory as large as the recorded capacity. Otherwise, memory would be reserved based
+ *                        on the value of `min_guarantee`, current size, and the prototype.
+ */
+void h2o_buffer_consume_all(h2o_buffer_t **inbuf, int record_capacity);
 /**
  * resets the buffer prototype
  */
@@ -390,6 +422,11 @@ inline void *h2o_memcpy(void *dst, const void *src, size_t n)
     return dst;
 }
 
+inline int h2o_mem_recycle_is_empty(h2o_mem_recycle_t *allocator)
+{
+    return allocator->chunks.size == 0;
+}
+
 inline h2o_iovec_t h2o_iovec_init(const void *base, size_t len)
 {
     /* intentionally declared to take a "const void*" since it may contain any type of data and since _some_ buffers are constant */
@@ -403,6 +440,17 @@ inline void *h2o_mem_alloc(size_t sz)
 {
     void *p = malloc(sz);
     if (p == NULL)
+        h2o_fatal("no memory");
+    return p;
+}
+
+inline void *h2o_mem_aligned_alloc(size_t alignment, size_t sz)
+{
+    if (alignment <= 1)
+        return h2o_mem_alloc(sz);
+
+    void *p;
+    if (posix_memalign(&p, alignment, sz) != 0)
         h2o_fatal("no memory");
     return p;
 }
@@ -454,7 +502,7 @@ inline void h2o_buffer_dispose(h2o_buffer_t **_buffer)
 {
     h2o_buffer_t *buffer = *_buffer;
     *_buffer = NULL;
-    if (buffer->bytes != NULL)
+    if (buffer->_prototype != NULL)
         h2o_buffer__do_free(buffer);
 }
 
@@ -531,7 +579,11 @@ inline void h2o_doublebuffer_consume(h2o_doublebuffer_t *db)
     assert(db->inflight);
     db->inflight = 0;
 
-    h2o_buffer_consume(&db->buf, db->_bytes_inflight);
+    if (db->buf->size == db->_bytes_inflight) {
+        h2o_buffer_consume_all(&db->buf, 1);
+    } else {
+        h2o_buffer_consume(&db->buf, db->_bytes_inflight);
+    }
     db->_bytes_inflight = 0;
 }
 

@@ -33,9 +33,15 @@ extern "C" {
 #include "h2o/send_state.h"
 #include "h2o/socket.h"
 #include "h2o/socketpool.h"
-#include "h2o/tunnel.h"
 
 typedef struct st_h2o_httpclient_t h2o_httpclient_t;
+
+/**
+ * maximum number of informational (1xx) responses accepted for each request; the request fails when more are received
+ */
+#define H2O_HTTPCLIENT_MAX_INFORMATIONAL_RESPONSES 10
+
+typedef void (*h2o_httpclient_forward_datagram_cb)(h2o_httpclient_t *client, h2o_iovec_t *datagrams, size_t num_datagrams);
 
 /**
  * Additional properties related to the HTTP request being issued.
@@ -57,10 +63,23 @@ typedef struct st_h2o_httpclient_properties_t {
     int *chunked;
     /**
      * When the value is a non-NULL pointer (at the moment, only happens with the HTTP/1 client), the application MAY set it to the
-     * value of the connection header field to be sent to the server. This can be used for upgrading an HTTP/1.1 connection.
+     * value of the connection header field to be sent to the server. This value is advisory in sense that 1) the server might
+     * decide to close the connection even if the client sent `keep-alive` and 2) the field may be rewritten to `upgrade` if the
+     * client requested upgrade (extended CONNECT).
      */
     h2o_iovec_t *connection_header;
+    /**
+     * defaults to false
+     */
+    unsigned prefer_pipe_reader : 1;
+    /**
+     * When the value is 1, httpclient sends 'expect: 100-continue' header and suspends sending request body
+     * until it sees 100-continue response
+     */
+    unsigned send_own_expect : 1;
 } h2o_httpclient_properties_t;
+
+typedef struct st_h2o_httpclient_pipe_reader_t h2o_httpclient_pipe_reader_t;
 
 typedef struct st_h2o_httpclient_on_head_t {
     int version;
@@ -69,11 +88,20 @@ typedef struct st_h2o_httpclient_on_head_t {
     h2o_header_t *headers;
     size_t num_headers;
     int header_requires_dup;
-    h2o_tunnel_t *tunnel;
+    struct {
+        h2o_httpclient_forward_datagram_cb write_, *read_;
+    } forward_datagram;
+    /**
+     * If this pointer is set to non-NULL by the HTTP client, it is offering the user the opportunity to read content to a pipe,
+     * rather than suppliend them as bytes. To take that opportunity, users should set the members of the pointed struct to
+     * appropriate values. Note that even when the user opts in to using a pipe, first chunk of content may still be served through
+     * memory, as the content would be read into memory alongside the HTTP response headers.
+     */
+    h2o_httpclient_pipe_reader_t *pipe_reader;
 } h2o_httpclient_on_head_t;
 
-typedef void (*h2o_httpclient_proceed_req_cb)(h2o_httpclient_t *client, size_t written, h2o_send_state_t send_state);
-typedef int (*h2o_httpclient_body_cb)(h2o_httpclient_t *client, const char *errstr);
+typedef void (*h2o_httpclient_proceed_req_cb)(h2o_httpclient_t *client, const char *errstr);
+typedef int (*h2o_httpclient_body_cb)(h2o_httpclient_t *client, const char *errstr, h2o_header_t *trailers, size_t num_trailers);
 typedef h2o_httpclient_body_cb (*h2o_httpclient_head_cb)(h2o_httpclient_t *client, const char *errstr,
                                                          h2o_httpclient_on_head_t *args);
 /**
@@ -89,6 +117,11 @@ typedef int (*h2o_httpclient_informational_cb)(h2o_httpclient_t *client, int ver
                                                h2o_header_t *headers, size_t num_headers);
 
 typedef void (*h2o_httpclient_finish_cb)(h2o_httpclient_t *client);
+
+struct st_h2o_httpclient_pipe_reader_t {
+    int fd;
+    h2o_httpclient_body_cb on_body_piped;
+};
 
 typedef struct st_h2o_httpclient_connection_pool_t {
     /**
@@ -160,9 +193,17 @@ typedef struct st_h2o_httpclient_ctx_t {
 } h2o_httpclient_ctx_t;
 
 struct st_h2o_http3client_ctx_t {
+    ptls_openssl_verify_certificate_t verify_cert;
     ptls_context_t tls;
     quicly_context_t quic;
     h2o_quic_ctx_t h3;
+    h2o_http3_qpack_context_t qpack;
+    uint64_t max_frame_payload_size;
+    /**
+     * maximum number of requests issued concurrently over a connection; once reached, new requests are issued using another
+     * connection
+     */
+    uint64_t max_concurrent_streams;
     /**
      * Optional callback invoked by the HTTP/3 client implementation to obtain information used for resuming a connection. When the
      * connection is to be resumed, the callback should set `*address_token` and `*session_ticket` to a vector that can be freed by
@@ -223,7 +264,7 @@ struct st_h2o_httpclient_t {
      */
     void *data;
     /**
-     * optional callback to receive informational response(s)
+     * optional callback to receive informational response(s); 101 is considered final and is never delivered through this callback
      */
     h2o_httpclient_informational_cb informational_cb;
     /**
@@ -233,7 +274,7 @@ struct st_h2o_httpclient_t {
     /**
      * If the stream is to be converted to convey some other protocol, this value should be set to the name of the protocol, which
      * will be indicated by the `upgrade` request header field. Additionally, intent to create a CONNECT tunnel is indicated by a
-     * special label called `h2o_httpclient_req_upgrade_connect`.
+     * special label called `h2o_httpclient_upgrade_to_connect`.
      */
     const char *upgrade_to;
 
@@ -268,8 +309,8 @@ struct st_h2o_httpclient_t {
      */
     void (*update_window)(h2o_httpclient_t *client);
     /**
-     * function for writing request body. `proceed_req_cb` supplied through the `on_connect` callback will be called when the
-     * given data is sent to the server.
+     * Function for writing request body. `proceed_req_cb` supplied through the `on_connect` callback will be called when the
+     * given data is sent to the server. Regarding the usage, refer to the doc-comment of `h2o_write_req_cb`.
      */
     int (*write_req)(h2o_httpclient_t *client, h2o_iovec_t chunk, int is_end_stream);
 
@@ -337,8 +378,16 @@ struct st_h2o_httpclient__h3_conn_t {
      * linklist used to queue pending requests
      */
     h2o_linklist_t pending_requests;
+    /**
+     * number of requests associated to the connection, including the pending ones
+     */
+    uint64_t num_requests;
 };
 
+/**
+ * Indicates end-of-stream. When this error code is supplied to `h2o_httpclient_proceed_req_cb`, it indicates the server's ask to
+ * stop sending more bytes, typically after an early response is supplied.
+ */
 extern const char h2o_httpclient_error_is_eos[];
 extern const char h2o_httpclient_error_refused_stream[];
 extern const char h2o_httpclient_error_unknown_alpn_protocol[];
@@ -351,9 +400,12 @@ extern const char h2o_httpclient_error_flow_control[];
 extern const char h2o_httpclient_error_http1_line_folding[];
 extern const char h2o_httpclient_error_http1_unexpected_transfer_encoding[];
 extern const char h2o_httpclient_error_http1_parse_failed[];
+extern const char h2o_httpclient_error_http1_headers_too_long[];
 extern const char h2o_httpclient_error_protocol_violation[];
 extern const char h2o_httpclient_error_internal[];
 extern const char h2o_httpclient_error_malformed_frame[];
+extern const char h2o_httpclient_error_unexpected_101[];
+extern const char h2o_httpclient_error_too_many_informational[];
 
 extern const char h2o_httpclient_upgrade_to_connect[];
 
@@ -382,23 +434,29 @@ void h2o_httpclient_set_conn_properties_of_socket(h2o_socket_t *sock, h2o_httpcl
 
 void h2o_httpclient_http3_notify_connection_update(h2o_quic_ctx_t *ctx, h2o_quic_conn_t *conn);
 extern quicly_stream_open_t h2o_httpclient_http3_on_stream_open;
+extern quicly_receive_datagram_frame_t h2o_httpclient_http3_on_receive_datagram_frame;
 void h2o_httpclient__connect_h3(h2o_httpclient_t **client, h2o_mem_pool_t *pool, void *data, h2o_httpclient_ctx_t *ctx,
                                 h2o_httpclient_connection_pool_t *connpool, h2o_url_t *target, const char *upgrade_to,
                                 h2o_httpclient_connect_cb cb);
 /**
  * internal API for checking if the stream is to be turned into a tunnel
  */
-static int h2o_httpclient__tunnel_is_ready(h2o_httpclient_t *client, int status);
+static int h2o_httpclient__tunnel_is_ready(h2o_httpclient_t *client, int status, int http_version);
 
 /* inline definitions */
 
-inline int h2o_httpclient__tunnel_is_ready(h2o_httpclient_t *client, int status)
+inline int h2o_httpclient__tunnel_is_ready(h2o_httpclient_t *client, int status, int http_version)
 {
     if (client->upgrade_to != NULL) {
         if (client->upgrade_to == h2o_httpclient_upgrade_to_connect && 200 <= status && status <= 299)
             return 1;
-        if (status == 101)
-            return 1;
+        if (http_version < 0x200) {
+            if (status == 101)
+                return 1;
+        } else {
+            if (200 <= status && status <= 299)
+                return 1;
+        }
     }
     return 0;
 }

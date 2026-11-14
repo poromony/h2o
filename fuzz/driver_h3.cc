@@ -42,6 +42,7 @@
 static h2o_globalconf_t config;
 static h2o_context_t ctx;
 static h2o_accept_ctx_t accept_ctx;
+static quicly_cid_plaintext_t next_cid;
 static h2o_http3_server_ctx_t server_ctx;
 static quicly_context_t qctx = quicly_spec_context;
 static ptls_context_t ptls_ctx = {
@@ -141,11 +142,14 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
         accept_ctx.ctx = &ctx;
         accept_ctx.hosts = config.hosts;
 
+        server_ctx.super.next_cid = &next_cid;
         server_ctx.accept_ctx = &accept_ctx;
         server_ctx.send_retry = 0;
         server_ctx.qpack.encoder_table_capacity = 4096;
 
         conn_callbacks.super.destroy_connection = on_destroy_connection;
+
+        ptls_log._generation = 0; /* disable tracing */
 
         quic_init_context(&server_ctx.super, ctx.loop);
         h2o_http3_server_amend_quicly_context(&config, server_ctx.super.quic);
@@ -164,15 +168,16 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
     ++num_connections;
     sent_response = false;
     h2o_http3_conn_t *conn = h2o_http3_server_accept(&server_ctx, &dst_addr, &src_addr, NULL /* initial_packet */,
-                                                     NULL /* address_token */, 0 /* skip_tracing */, &conn_callbacks);
+                                                     NULL /* address_token */, &conn_callbacks);
     assert(conn != NULL);
-    assert(&conn->super != H2O_QUIC_ACCEPT_CONN_DECRYPTION_FAILED);
+    assert(&conn->super != &h2o_quic_accept_conn_decryption_failed);
     quicly_stream_t *stream;
     int ret = mquicly_open_stream(conn->super.quic, &stream, 1 /* remote initiated */, 0 /* bidi */);
     assert(ret == 0);
     assert(stream != NULL);
 
-    quicly_recvstate_update(&stream->recvstate, 0, &Size, 1, 63);
+    uint64_t off = 0;
+    quicly_recvstate_update(&stream->recvstate, &off, &Size, 1, Size);
     stream->callbacks->on_receive(stream, 0, Data, Size);
 
     uint64_t loop_start = h2o_now(ctx.loop);
@@ -200,7 +205,7 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
         }
     } while (!sent_response);
 
-    mquicly_closed_by_remote(conn->super.quic, 0, 0 /* TODO: frame_type */, ptls_iovec_init(NULL, 0));
+    mquicly_closed(conn->super.quic, 0, 0 /* TODO: frame_type */, ptls_iovec_init(NULL, 0), 1);
     /* simulate timer update at the end of process_packets() */
     h2o_quic_schedule_timer(&conn->super);
 

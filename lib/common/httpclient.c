@@ -34,14 +34,17 @@ const char h2o_httpclient_error_flow_control[] = "flow control error";
 const char h2o_httpclient_error_http1_line_folding[] = "line folding of header fields is not supported";
 const char h2o_httpclient_error_http1_unexpected_transfer_encoding[] = "unexpected type of transfer-encoding";
 const char h2o_httpclient_error_http1_parse_failed[] = "failed to parse the response";
+const char h2o_httpclient_error_http1_headers_too_long[] = "response headers too long";
 const char h2o_httpclient_error_protocol_violation[] = "protocol violation";
 const char h2o_httpclient_error_internal[] = "internal error";
 const char h2o_httpclient_error_malformed_frame[] = "malformed HTTP frame";
+const char h2o_httpclient_error_unexpected_101[] = "received unexpected 101 response";
+const char h2o_httpclient_error_too_many_informational[] = "too many informational responses";
 
 /**
  * Used to indicate that the HTTP request is to be "upgraded" into a CONNECT tunnel.
  */
-const char h2o_httpclient_upgrade_to_connect[] = "\nCONNECT method";
+const char h2o_httpclient_upgrade_to_connect[] = "\nCONNECT / CONNECT-UDP method";
 
 void h2o_httpclient_connection_pool_init(h2o_httpclient_connection_pool_t *connpool, h2o_socketpool_t *sockpool)
 {
@@ -243,14 +246,10 @@ void h2o_httpclient_connect(h2o_httpclient_t **_client, h2o_mem_pool_t *pool, vo
 
     /* adjust selected protocol if the attempt is to create a tunnel */
     if (upgrade_to != NULL) {
-        if (upgrade_to == h2o_httpclient_upgrade_to_connect) {
-            /* CONNECT method is not supported by our H2 client implementation */
-            if (selected_protocol == PROTOCOL_SELECTOR_H2 || selected_protocol == PROTOCOL_SELECTOR_SERVER_DRIVEN)
-                selected_protocol = PROTOCOL_SELECTOR_H1;
-        } else {
-            /* upgrade supported only by H1 */
+        /* TODO provide a knob to map each upgrade token to some, all, or no HTTP version. Until that is done, upgrade other than to
+         * a CONNECT and CONNECT-UDP tunnel is directed to H1. */
+        if (upgrade_to != h2o_httpclient_upgrade_to_connect && strcmp(upgrade_to, "connect-udp") != 0)
             selected_protocol = PROTOCOL_SELECTOR_H1;
-        }
     }
 
     switch (selected_protocol) {
@@ -277,7 +276,7 @@ void h2o_httpclient_connect(h2o_httpclient_t **_client, h2o_mem_pool_t *pool, vo
             /* both of h1 and h2 connections exist, compare in-use ratio */
             double http1_ratio = (double)(connpool->socketpool->_shared.count - connpool->socketpool->_shared.pooled_count) /
                                  connpool->socketpool->_shared.count;
-            double http2_ratio = h2conn->num_streams / h2o_httpclient__h2_get_max_concurrent_streams(h2conn);
+            double http2_ratio = (double)h2conn->num_streams / h2o_httpclient__h2_get_max_concurrent_streams(h2conn);
             if (http2_ratio <= http1_ratio) {
                 connect_using_h2conn(_client, pool, data, h2conn, connpool, upgrade_to, on_connect);
             } else {

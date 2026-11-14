@@ -39,6 +39,7 @@
 #include <sys/time.h>
 #include <sys/types.h>
 #include <unistd.h>
+#define OPENSSL_API_COMPAT 0x00908000L
 #include <openssl/err.h>
 #include <openssl/evp.h>
 #include <openssl/engine.h>
@@ -66,6 +67,17 @@ static void shift_buffer(ptls_buffer_t *buf, size_t delta)
     }
 }
 
+static void setup_ptlslog(const char *fn)
+{
+    int fd;
+    if ((fd = open(fn, O_WRONLY | O_CREAT | O_APPEND, 0666)) == -1) {
+        fprintf(stderr, "failed to open file:%s:%s\n", fn, strerror(errno));
+        exit(1);
+    }
+    ptls_log_add_fd(fd, 1., NULL, NULL, NULL, 1);
+    ptls_log.may_include_appdata = 1;
+}
+
 static int handle_connection(int sockfd, ptls_context_t *ctx, const char *server_name, const char *input_file,
                              ptls_handshake_properties_t *hsprop, int request_key_update, int keep_sender_open)
 {
@@ -85,7 +97,10 @@ static int handle_connection(int sockfd, ptls_context_t *ctx, const char *server
     ptls_buffer_init(&encbuf, "", 0);
     ptls_buffer_init(&ptbuf, "", 0);
 
-    fcntl(sockfd, F_SETFL, O_NONBLOCK);
+    if (fcntl(sockfd, F_SETFL, O_NONBLOCK) == -1) {
+        perror("fcntl");
+        goto Exit;
+    }
 
     if (input_file == input_file_is_benchmark) {
         if (!ptls_is_server(tls))
@@ -148,6 +163,7 @@ static int handle_connection(int sockfd, ptls_context_t *ctx, const char *server
                     if ((ret = ptls_handshake(tls, &encbuf, bytebuf + off, &leftlen, hsprop)) == 0) {
                         state = IN_1RTT;
                         assert(ptls_is_server(tls) || hsprop->client.early_data_acceptance != PTLS_EARLY_DATA_ACCEPTANCE_UNKNOWN);
+                        ech_save_retry_configs();
                         /* release data sent as early-data, if server accepted it */
                         if (hsprop->client.early_data_acceptance == PTLS_EARLY_DATA_ACCEPTED)
                             shift_buffer(&ptbuf, early_bytes_sent);
@@ -156,8 +172,12 @@ static int handle_connection(int sockfd, ptls_context_t *ctx, const char *server
                     } else if (ret == PTLS_ERROR_IN_PROGRESS) {
                         /* ok */
                     } else {
+                        if (ret == PTLS_ALERT_ECH_REQUIRED) {
+                            assert(!ptls_is_server(tls));
+                            ech_save_retry_configs();
+                        }
                         if (encbuf.off != 0)
-                            (void)write(sockfd, encbuf.base, encbuf.off);
+                            repeat_while_eintr(write(sockfd, encbuf.base, encbuf.off), { break; });
                         fprintf(stderr, "ptls_handshake:%d\n", ret);
                         goto Exit;
                     }
@@ -166,7 +186,7 @@ static int handle_connection(int sockfd, ptls_context_t *ctx, const char *server
                         if (rbuf.off != 0) {
                             data_received += rbuf.off;
                             if (input_file != input_file_is_benchmark)
-                                write(1, rbuf.base, rbuf.off);
+                                repeat_while_eintr(write(1, rbuf.base, rbuf.off), { goto Exit; });
                             rbuf.off = 0;
                         }
                     } else if (ret == PTLS_ERROR_IN_PROGRESS) {
@@ -253,7 +273,10 @@ static int handle_connection(int sockfd, ptls_context_t *ctx, const char *server
                     fprintf(stderr, "ptls_send_alert:%d\n", ret);
                 }
                 if (wbuf.off != 0)
-                    (void)write(sockfd, wbuf.base, wbuf.off);
+                    repeat_while_eintr(write(sockfd, wbuf.base, wbuf.off), {
+                        ptls_buffer_dispose(&wbuf);
+                        goto Exit;
+                    });
                 ptls_buffer_dispose(&wbuf);
                 shutdown(sockfd, SHUT_WR);
             }
@@ -318,8 +341,6 @@ static int run_client(struct sockaddr *sa, socklen_t salen, ptls_context_t *ctx,
 {
     int fd;
 
-    hsprop->client.esni_keys = resolve_esni_keys(server_name);
-
     if ((fd = socket(sa->sa_family, SOCK_STREAM, 0)) == 1) {
         perror("socket(2) failed");
         return 1;
@@ -330,7 +351,6 @@ static int run_client(struct sockaddr *sa, socklen_t salen, ptls_context_t *ctx,
     }
 
     int ret = handle_connection(fd, ctx, server_name, input_file, hsprop, request_key_update, keep_sender_open);
-    free(hsprop->client.esni_keys.base);
     return ret;
 }
 
@@ -350,35 +370,52 @@ static void usage(const char *cmd)
            "  -c certificate-file  certificate chain used for server authentication\n"
            "  -i file              a file to read from and send to the peer (default: stdin)\n"
            "  -I                   keep send side open after sending all data (client-only)\n"
+           "  -j log-file          file to log probe events in JSON-Lines\n"
            "  -k key-file          specifies the credentials for signing the certificate\n"
+           "  -K key-file          ECH private key for each ECH config provided by -E\n"
            "  -l log-file          file to log events (incl. traffic secrets)\n"
            "  -n                   negotiates the key exchange method (i.e. wait for HRR)\n"
-           "  -N named-group       named group to be used (default: secp256r1)\n"
+           "  -N named-group       named group to be used (default: secp256r1); if \"null\"\n"
+           "                       is specified alongside `-p`, external PSK handshake with\n"
+           "                       no ECDHE is performed\n"
            "  -s session-file      file to read/write the session ticket\n"
            "  -S                   require public key exchange when resuming a session\n"
-           "  -E esni-file         file that stores ESNI data generated by picotls-esni\n"
+           "  -E echconfiglist     file that contains ECHConfigList or an empty file to\n"
+           "                       grease ECH; will be overwritten when receiving\n"
+           "                       retry_configs from the server\n"
            "  -e                   when resuming a session, send first 8,192 bytes of input\n"
            "                       as early data\n"
            "  -r public-key-file   use raw public keys (RFC 7250). When set and running as a\n"
            "                       client, the argument specifies the public keys that the\n"
            "                       server is expected to use. When running as a server, the\n"
            "                       argument is ignored.\n"
+           "  -p psk-identity      name of the PSK key; if set, -c and -C specify the\n"
+           "                       pre-shared secret\n"
+           "  -P psk-hash          hash function associated to the PSK (default: sha256)\n"
+           "  -T new_session_count,resumption_count\n"
+           "                       set number of session tickets to request\n"
            "  -u                   update the traffic key when handshake is complete\n"
            "  -v                   verify peer using the default certificates\n"
            "  -V CA-root-file      verify peer using the CA Root File\n"
-           "  -y cipher-suite      cipher-suite to be used, e.g., aes128gcmsha256 (default:\n"
-           "                       all)\n"
+           "  -y cipher-suite      cipher-suite to be used\n"
            "  -h                   print this help\n"
            "\n"
-           "Supported named groups: secp256r1"
+           "Supported named groups: " PTLS_GROUP_NAME_SECP256R1
 #if PTLS_OPENSSL_HAVE_SECP384R1
-           ", secp384r1"
+           ", " PTLS_GROUP_NAME_SECP384R1
 #endif
 #if PTLS_OPENSSL_HAVE_SECP521R1
-           ", secp521r1"
+           ", " PTLS_GROUP_NAME_SECP521R1
 #endif
 #if PTLS_OPENSSL_HAVE_X25519
-           ", X25519"
+           ", " PTLS_GROUP_NAME_X25519
+#endif
+#if PTLS_OPENSSL_HAVE_X25519MLKEM768
+           ", " PTLS_GROUP_NAME_X25519MLKEM768
+#endif
+#if PTLS_OPENSSL_HAVE_MLKEM
+           ", " PTLS_GROUP_NAME_SECP256R1MLKEM768 ", " PTLS_GROUP_NAME_SECP384R1MLKEM1024 ", " PTLS_GROUP_NAME_MLKEM512 ", "
+           PTLS_GROUP_NAME_MLKEM768 ", " PTLS_GROUP_NAME_MLKEM1024
 #endif
            "\n"
            "Supported signature algorithms: rsa, secp256r1"
@@ -391,8 +428,15 @@ static void usage(const char *cmd)
 #if PTLS_OPENSSL_HAVE_ED25519
            ", ed25519"
 #endif
-           "\n\n",
+           "\n",
            cmd);
+    printf("Supported cipher suites:");
+    for (size_t i = 0; ptls_openssl_cipher_suites_all[i] != NULL; ++i) {
+        if (i != 0)
+            printf(",");
+        printf(" %s", ptls_openssl_cipher_suites_all[i]->name);
+    }
+    printf("\n\n");
 }
 
 int main(int argc, char **argv)
@@ -410,20 +454,22 @@ int main(int argc, char **argv)
 
     ptls_key_exchange_algorithm_t *key_exchanges[128] = {NULL};
     ptls_cipher_suite_t *cipher_suites[128] = {NULL};
-    ptls_context_t ctx = {ptls_openssl_random_bytes, &ptls_get_time, key_exchanges, cipher_suites};
+    ptls_context_t ctx = {
+        .random_bytes = ptls_openssl_random_bytes,
+        .get_time = &ptls_get_time,
+        .key_exchanges = key_exchanges,
+        .cipher_suites = cipher_suites,
+        .ech = {.client = {ptls_openssl_hpke_cipher_suites, ptls_openssl_hpke_kems}, .server = {NULL /* activated by -K option */}},
+    };
     ptls_handshake_properties_t hsprop = {{{{NULL}}}};
-    const char *host, *port, *input_file = NULL, *esni_file = NULL;
-    struct {
-        ptls_key_exchange_context_t *elements[16];
-        size_t count;
-    } esni_key_exchanges;
+    const char *host, *port, *input_file = NULL, *psk_hash = "sha256";
     int is_server = 0, use_early_data = 0, request_key_update = 0, keep_sender_open = 0, ch;
     struct sockaddr_storage sa;
     socklen_t salen;
     int family = 0;
     const char *raw_pub_key_file = NULL, *cert_location = NULL;
 
-    while ((ch = getopt(argc, argv, "46abBC:c:i:Ik:nN:es:Sr:E:K:l:y:vV:h")) != -1) {
+    while ((ch = getopt(argc, argv, "46abBC:c:i:Ij:k:nN:es:Sr:p:P:E:K:l:T:uy:vV:h")) != -1) {
         switch (ch) {
         case '4':
             family = AF_INET;
@@ -460,6 +506,9 @@ int main(int argc, char **argv)
         case 'I':
             keep_sender_open = 1;
             break;
+        case 'j':
+            setup_ptlslog(optarg);
+            break;
         case 'k':
             load_private_key(&ctx, optarg);
             break;
@@ -472,6 +521,12 @@ int main(int argc, char **argv)
         case 'r':
             raw_pub_key_file = optarg;
             break;
+        case 'p':
+            ctx.pre_shared_key.identity = ptls_iovec_init(optarg, strlen(optarg));
+            break;
+        case 'P':
+            psk_hash = optarg;
+            break;
         case 's':
             setup_session_file(&ctx, &hsprop, optarg);
             break;
@@ -479,27 +534,11 @@ int main(int argc, char **argv)
             ctx.require_dhe_on_psk = 1;
             break;
         case 'E':
-            esni_file = optarg;
+            ech_setup_configs(optarg);
             break;
-        case 'K': {
-            FILE *fp;
-            EVP_PKEY *pkey;
-            int ret;
-            if ((fp = fopen(optarg, "rt")) == NULL) {
-                fprintf(stderr, "failed to open ESNI private key file:%s:%s\n", optarg, strerror(errno));
-                return 1;
-            }
-            if ((pkey = PEM_read_PrivateKey(fp, NULL, NULL, NULL)) == NULL) {
-                fprintf(stderr, "failed to load private key from file:%s\n", optarg);
-                return 1;
-            }
-            if ((ret = ptls_openssl_create_key_exchange(esni_key_exchanges.elements + esni_key_exchanges.count++, pkey)) != 0) {
-                fprintf(stderr, "failed to load private key from file:%s:picotls-error:%d", optarg, ret);
-                return 1;
-            }
-            EVP_PKEY_free(pkey);
-            fclose(fp);
-        } break;
+        case 'K':
+            ech_setup_key(&ctx, optarg);
+            break;
         case 'l':
             setup_log_event(&ctx, optarg);
             break;
@@ -509,52 +548,58 @@ int main(int argc, char **argv)
         case 'V':
             setup_verify_certificate(&ctx, optarg);
             break;
-        case 'N': {
-            ptls_key_exchange_algorithm_t *algo = NULL;
-#define MATCH(name)                                                                                                                \
-    if (algo == NULL && strcasecmp(optarg, #name) == 0)                                                                            \
-    algo = (&ptls_openssl_##name)
-            MATCH(secp256r1);
-#if PTLS_OPENSSL_HAVE_SECP384R1
-            MATCH(secp384r1);
-#endif
-#if PTLS_OPENSSL_HAVE_SECP521R1
-            MATCH(secp521r1);
-#endif
-#if PTLS_OPENSSL_HAVE_X25519
-            MATCH(x25519);
-#endif
-#undef MATCH
-            if (algo == NULL) {
-                fprintf(stderr, "could not find key exchange: %s\n", optarg);
-                return 1;
+        case 'N':
+            if (strcasecmp(optarg, "null") == 0) {
+                /* disable use of key exchanges entirely */
+                ctx.key_exchanges = NULL;
+            } else {
+                ptls_key_exchange_algorithm_t **named;
+                for (named = ptls_openssl_key_exchanges_all; *named != NULL; ++named)
+                    if (strcasecmp((*named)->name, optarg) == 0)
+                        break;
+                if (*named == NULL) {
+                    fprintf(stderr, "could not find key exchange: %s\n", optarg);
+                    return 1;
+                }
+                size_t i;
+                for (i = 0; key_exchanges[i] != NULL; ++i)
+                    ;
+                key_exchanges[i++] = *named;
             }
-            size_t i;
-            for (i = 0; key_exchanges[i] != NULL; ++i)
-                ;
-            key_exchanges[i++] = algo;
-        } break;
+            break;
         case 'u':
             request_key_update = 1;
             break;
         case 'y': {
-            size_t i;
-            for (i = 0; cipher_suites[i] != NULL; ++i)
-                ;
-#define MATCH(name)                                                                                                                \
-    if (cipher_suites[i] == NULL && strcasecmp(optarg, #name) == 0)                                                                \
-    cipher_suites[i] = &ptls_openssl_##name
-            MATCH(aes128gcmsha256);
-            MATCH(aes256gcmsha384);
-#if PTLS_OPENSSL_HAVE_CHACHA20_POLY1305
-            MATCH(chacha20poly1305sha256);
-#endif
-#undef MATCH
-            if (cipher_suites[i] == NULL) {
-                fprintf(stderr, "unknown cipher-suite: %s\n", optarg);
+            /* find the cipher suite to be added from `ptls_openssl_cipher_suites_all` */
+            ptls_cipher_suite_t *added = NULL;
+            for (size_t i = 0; ptls_openssl_cipher_suites_all[i] != NULL; ++i) {
+                if (strcasecmp(ptls_openssl_cipher_suites_all[i]->name, optarg) == 0) {
+                    added = ptls_openssl_cipher_suites_all[i];
+                    break;
+                }
+            }
+            if (added == NULL) {
+                fprintf(stderr, "unknown cipher-suite: %s, see -h for list of cipher-suites supported\n", optarg);
                 exit(1);
             }
+
+            size_t slot;
+            for (slot = 0; cipher_suites[slot] != NULL; ++slot) {
+                if (cipher_suites[slot]->id == added->id) {
+                    fprintf(stderr, "cipher-suite %s is already in list\n", added->name);
+                    exit(1);
+                }
+            }
+            cipher_suites[slot] = added;
         } break;
+        case 'T':
+            if (sscanf(optarg, "%" SCNu8 ",%" SCNu8, &ctx.ticket_requests.client.new_session_count,
+                       &ctx.ticket_requests.client.resumption_count) != 2) {
+                fprintf(stderr, "invalid argument passed to -T, should be in the form of <new_session_count>,<resumption_count>\n");
+                exit(1);
+            }
+            break;
         case 'h':
             usage(argv[0]);
             exit(0);
@@ -584,8 +629,14 @@ int main(int argc, char **argv)
             EVP_PKEY_free(pubkey);
         }
         ctx.use_raw_public_keys = 1;
+    } else if (ctx.pre_shared_key.identity.base != NULL) {
+        if (cert_location == NULL) {
+            fprintf(stderr, "-p must be used with -C or -c\n");
+            return 1;
+        }
+        ctx.pre_shared_key.secret = load_file(cert_location);
     } else {
-        if (cert_location)
+        if (cert_location != NULL)
             load_certificate_chain(&ctx, cert_location);
     }
 
@@ -595,12 +646,8 @@ int main(int argc, char **argv)
     }
 
     if (is_server) {
-        if (ctx.certificates.count == 0) {
-            fprintf(stderr, "-c and -k options must be set\n");
-            return 1;
-        }
 #if PICOTLS_USE_BROTLI
-        if (ctx.decompress_certificate != NULL) {
+        if (ctx.certificates.count != 0 && ctx.decompress_certificate != NULL) {
             static ptls_emit_compressed_certificate_t ecc;
             if (ptls_init_compressed_certificate(&ecc, ctx.certificates.list, ctx.certificates.count, ptls_iovec_init(NULL, 0)) !=
                 0) {
@@ -618,20 +665,25 @@ int main(int argc, char **argv)
             hsprop.client.max_early_data_size = &max_early_data_size;
         }
         ctx.send_change_cipher_spec = 1;
+        hsprop.client.ech.configs = ech.config_list;
+        hsprop.client.ech.retry_configs = &ech.retry.configs;
     }
     if (key_exchanges[0] == NULL)
         key_exchanges[0] = &ptls_openssl_secp256r1;
     if (cipher_suites[0] == NULL) {
-        size_t i;
-        for (i = 0; ptls_openssl_cipher_suites[i] != NULL; ++i)
+        for (size_t i = 0; ptls_openssl_cipher_suites[i] != NULL; ++i)
             cipher_suites[i] = ptls_openssl_cipher_suites[i];
     }
-    if (esni_file != NULL) {
-        if (esni_key_exchanges.count == 0) {
-            fprintf(stderr, "-E must be used together with -K\n");
-            return 1;
+    if (ctx.pre_shared_key.identity.base != NULL) {
+        size_t i;
+        for (i = 0; cipher_suites[i] != NULL; ++i)
+            if (strcmp(cipher_suites[i]->hash->name, psk_hash) == 0)
+                break;
+        if (cipher_suites[i] == NULL) {
+            fprintf(stderr, "no compatible cipher-suite for psk hash: %s\n", psk_hash);
+            exit(1);
         }
-        setup_esni(&ctx, esni_file, esni_key_exchanges.elements);
+        ctx.pre_shared_key.hash = cipher_suites[i]->hash;
     }
     if (argc != 2) {
         fprintf(stderr, "missing host and port\n");

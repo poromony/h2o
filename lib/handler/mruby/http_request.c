@@ -140,7 +140,7 @@ const static struct mrb_data_type input_stream_type = {"http_input_stream", on_g
 
 static mrb_value create_already_consumed_error(mrb_state *mrb)
 {
-    return mrb_exc_new_str_lit(mrb, E_RUNTIME_ERROR, "http response body is already consumed");
+    return mrb_exc_new_lit(mrb, E_RUNTIME_ERROR, "http response body is already consumed");
 }
 
 static h2o_buffer_t **peek_content(h2o_mruby_http_request_context_t *ctx, int *is_final)
@@ -272,8 +272,8 @@ static void post_response(struct st_h2o_mruby_http_request_context_t *ctx, int s
     mrb_value headers_hash = mrb_hash_new_capa(mrb, (int)num_headers);
     for (i = 0; i < num_headers; ++i) {
         /* skip the headers, we determine the eos! */
-        if (h2o_memis(headers_sorted[i].name, headers_sorted[i].name->len, H2O_STRLIT("content-length")) ||
-            h2o_memis(headers_sorted[i].name, headers_sorted[i].name->len, H2O_STRLIT("transfer-encoding")))
+        if (h2o_memis(headers_sorted[i].name->base, headers_sorted[i].name->len, H2O_STRLIT("content-length")) ||
+            h2o_memis(headers_sorted[i].name->base, headers_sorted[i].name->len, H2O_STRLIT("transfer-encoding")))
             continue;
         /* build and set the hash entry */
         mrb_value k, v;
@@ -387,7 +387,7 @@ static int do_on_body(h2o_httpclient_t *client, const char *errstr)
     return 0;
 }
 
-static int on_body(h2o_httpclient_t *client, const char *errstr)
+static int on_body(h2o_httpclient_t *client, const char *errstr, h2o_header_t *trailers, size_t num_trailers)
 {
     struct st_h2o_mruby_http_request_context_t *ctx = client->data;
     if (try_dispose_context(ctx))
@@ -550,8 +550,12 @@ static mrb_value http_request_method(mrb_state *mrb, mrb_value self)
     ctx->refs.input_stream = mrb_nil_value();
     ctx->req.can_keepalive = h2o_socketpool_can_keepalive(&shared_ctx->ctx->globalconf->proxy.global_socketpool);
 
+    /* build request; from now on, ctx is owned by the request object, so that it is released by GC if an exception is raised */
+    ctx->refs.request = h2o_mruby_create_data_instance(
+        mrb, mrb_ary_entry(ctx->ctx->shared->constants, H2O_MRUBY_HTTP_REQUEST_CLASS), ctx, &request_type);
+
     /* uri */
-    if (h2o_url_parse(arg_url, arg_url_len, &url) != 0)
+    if (h2o_url_parse(&ctx->pool, arg_url, arg_url_len, &url) != 0)
         mrb_raise(mrb, E_ARGUMENT_ERROR, "invaild URL");
     h2o_url_copy(&ctx->pool, &ctx->req.url, &url);
 
@@ -600,10 +604,7 @@ static mrb_value http_request_method(mrb_state *mrb, mrb_value self)
         }
     }
 
-    /* build request and connect */
-    ctx->refs.request = h2o_mruby_create_data_instance(
-        mrb, mrb_ary_entry(ctx->ctx->shared->constants, H2O_MRUBY_HTTP_REQUEST_CLASS), ctx, &request_type);
-
+    /* connect */
     h2o_httpclient_connect(&ctx->client, &ctx->pool, ctx, &shared_ctx->ctx->proxy.client_ctx, &shared_ctx->ctx->proxy.connpool,
                            &url, NULL, on_connect);
 
@@ -618,7 +619,7 @@ static mrb_value http_join_response_callback(h2o_mruby_context_t *mctx, mrb_valu
 
     if ((ctx = mrb_data_check_get_ptr(mrb, mrb_ary_entry(args, 0), &request_type)) == NULL) {
         *run_again = 1;
-        return mrb_exc_new_str_lit(mrb, E_ARGUMENT_ERROR, "HttpRequest#join wrong self");
+        return mrb_exc_new_lit(mrb, E_ARGUMENT_ERROR, "HttpRequest#join wrong self");
     }
 
     attach_receiver(ctx, *receiver);
@@ -634,7 +635,7 @@ static mrb_value http_fetch_chunk_callback(h2o_mruby_context_t *mctx, mrb_value 
 
     if ((ctx = mrb_data_check_get_ptr(mrb, mrb_ary_entry(args, 0), &input_stream_type)) == NULL) {
         *run_again = 1;
-        return mrb_exc_new_str_lit(mrb, E_ARGUMENT_ERROR, "_HttpInputStream#each wrong self");
+        return mrb_exc_new_lit(mrb, E_ARGUMENT_ERROR, "_HttpInputStream#each wrong self");
     }
 
     mrb_value first = mrb_ary_entry(args, 1);

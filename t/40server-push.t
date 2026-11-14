@@ -1,6 +1,6 @@
 use strict;
 use warnings;
-use Net::EmptyPort qw(check_port empty_port);
+use Net::EmptyPort qw(check_port);
 use Test::More;
 use t::Util;
 
@@ -26,6 +26,7 @@ subtest "basic" => sub {
     );
     # spawn server
     my $server = spawn_h2o(<< "EOT");
+file.io_uring: OFF
 hosts:
   default:
     paths:
@@ -37,6 +38,11 @@ hosts:
             [399, { "link" => "</index.txt.gz>; rel=preload" }, [] ]
           end
         proxy.reverse.url: http://127.0.0.1:$upstream_port
+      /push-unprioritized:
+        mruby.handler: |
+          Proc.new do |env|
+            [200, { "link" => "</assets/index.txt>; rel=preload" }, [ File.read("@{[DOC_ROOT]}/halfdome.jpg") ] ]
+          end
       /mruby-critical:
         mruby.handler: |
           Proc.new do |env|
@@ -55,8 +61,8 @@ EOT
         };
         subtest 'push-unprioritized' => sub {
             # index.txt is smaller than index.txt.gz, hence receiving the former always completes first
-            my $resp = `nghttp $opts -n --stat -w 1 '$proto://127.0.0.1:$port/index.txt?resp:link=</index.txt.gz>\%3b\%20rel=preload'`;
-            like $resp, qr{\nid\s*responseEnd\s.*\s/index\.txt\?.*\s/index\.txt.gz\n}is;
+            my $resp = `nghttp $opts -n --stat -W 20 -w 20 '$proto://127.0.0.1:$port/push-unprioritized'`;
+            like $resp, qr{\nid\s*responseEnd\s.*\s/push-unprioritized.*\s/assets/index\.txt}is;
         };
         subtest "push-1xx" => sub {
             my $out = `nghttp $opts -n --stat '$proto://127.0.0.1:$port/1xx-push/'`;
@@ -215,42 +221,6 @@ EOT
             unlike $resp, qr{\nid\s*responseEnd\s.*\s/index\.js\n}is, "does not receives index.js";
         }
     };
-};
-
-subtest "cache-digest" => sub {
-    plan skip_all => 'node not found'
-        unless prog_exists('node');
-    my $server = spawn_h2o(sub {
-        my ($port, $tls_port) = @_;
-        return << "EOT";
-hosts:
-  "127.0.0.1:$tls_port":
-    paths:
-      /:
-        mruby.handler: |
-          Proc.new do |env|
-            case env["PATH_INFO"]
-            when "/index.txt"
-              [399, {"link" => "</index.js>; rel=preload"}, []]
-            else
-              [399, {}, []]
-            end
-          end
-        file.dir: t/assets/doc_root
-EOT
-    });
-    my $calc_digest = sub {
-        my $cmd = "node misc/cache-digest.js/cli.js -b @{[join ' ', map { qq{https://127.0.0.1:$server->{tls_port}$_} } @_]}";
-        my $digest = `$cmd`;
-        chomp $digest;
-        return "$digest; complete";
-    };
-    my $resp = `nghttp -H'cache-digest: @{[$calc_digest->()]}' -v -n --stat https://127.0.0.1:$server->{tls_port}/index.txt`;
-    like $resp, qr{\nid\s*responseEnd\s.*\s/index\.js\n.*\s/index.txt}is, "receives index.js then /index.txt";
-    $resp = `nghttp -H'cache-digest: @{[$calc_digest->("/index.js", "/style.css")]}' -v -n --stat https://127.0.0.1:$server->{tls_port}/index.txt`;
-    unlike $resp, qr{\nid\s*responseEnd\s.*\s/index\.js\n}is, "does not receive index.js";
-    $resp = `nghttp -H'cache-digest: @{[$calc_digest->("/script.js", "/style.css")]}' -v -n --stat https://127.0.0.1:$server->{tls_port}/index.txt`;
-    like $resp, qr{\nid\s*responseEnd\s.*\s/index\.js\n.*\s/index.txt}is, "receives index.js then /index.txt";
 };
 
 subtest "cross-origin push" => sub {

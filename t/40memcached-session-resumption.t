@@ -1,7 +1,7 @@
 use strict;
 use warnings;
 use File::Temp qw(tempdir);
-use Net::EmptyPort qw(check_port empty_port);
+use Net::EmptyPort qw(check_port);
 use Test::More;
 use t::Util;
 
@@ -33,7 +33,7 @@ sub doit {
         # the test
         my $spawn_and_connect = sub {
             my ($opts, $expected) = @_;
-            my $server = spawn_h2o({conf => << "EOT", max_ssl_version => "TLSv1.2"});
+            my $server = spawn_h2o({conf => << "EOT", max_ssl_version => "TLSv1.2", disable_quic => 1});
 ssl-session-resumption:
   mode: cache
   cache-store: memcached
@@ -48,15 +48,11 @@ hosts:
         file.dir: @{[ DOC_ROOT ]}
 EOT
             sleep 1; # wait for h2o to connect to memcached
-            my $lines = do {
-                open my $fh, "-|", "openssl s_client -no_ticket $opts -connect 127.0.0.1:$server->{tls_port} 2>&1 < /dev/null"
-                    or die "failed to open pipe:$!";
-                local $/;
-                <$fh>;
-            };
+            my $lines = run_openssl_client({ host => "127.0.0.1", port => $server->{tls_port}, opts => "-no_ticket $opts" });
             $lines =~ m{---\n(New|Reused),}s
                 or die "failed to parse the output of s_client:{{{$lines}}}";
             is $1, $expected;
+            sleep 1; # wait for h2o to commit to memcached
         };
         $spawn_and_connect->("-sess_out $tempdir/session", "New");
         $spawn_and_connect->("-sess_in $tempdir/session", "Reused");

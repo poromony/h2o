@@ -29,8 +29,12 @@
 typedef struct st_test_streambuf_t {
     quicly_streambuf_t super;
     struct {
-        int stop_sending;
-        int reset_stream;
+        quicly_error_t stop_sending;
+        quicly_error_t reset_stream;
+        /**
+         * reset surfaced through `on_receive` as the end of the stream
+         */
+        quicly_error_t reset_on_receive;
     } error_received;
     int is_detached;
 } test_streambuf_t;
@@ -48,10 +52,12 @@ int buffer_is(ptls_buffer_t *buf, const char *s);
 size_t transmit(quicly_conn_t *src, quicly_conn_t *dst);
 int max_data_is_equal(quicly_conn_t *client, quicly_conn_t *server);
 
+void test_bplus_ranges(void);
 void test_ranges(void);
 void test_rate(void);
 void test_frame(void);
 void test_maxsender(void);
+void test_pacer(void);
 void test_sentmap(void);
 void test_loss(void);
 void test_simple(void);
@@ -59,6 +65,7 @@ void test_lossy(void);
 void test_stream_concurrency(void);
 void test_received_cid(void);
 void test_local_cid(void);
-void test_retire_cid(void);
+void test_jumpstart(void);
+void test_cc(void);
 
 #endif

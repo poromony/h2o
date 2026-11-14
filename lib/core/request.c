@@ -19,6 +19,7 @@
  * FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS
  * IN THE SOFTWARE.
  */
+#include <fcntl.h>
 #include <limits.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -48,12 +49,11 @@ struct st_reprocess_request_deferred_t {
 };
 
 struct st_send_error_deferred_t {
-    h2o_req_t *req;
+    struct st_deferred_request_action_t super;
     int status;
     const char *reason;
     const char *body;
     int flags;
-    h2o_timer_t _timeout;
 };
 
 static void on_deferred_action_dispose(void *_action)
@@ -134,14 +134,13 @@ h2o_hostconf_t *h2o_req_setup(h2o_req_t *req)
 
     req->processed_at = h2o_get_timestamp(ctx, &req->pool);
 
-    /* find the host context */
-    if (req->input.authority.base != NULL) {
+    /* find the host context (or use the default if authority is missing or is of zero-length) */
+    if (req->input.authority.len != 0) {
         if (req->conn->hosts[1] == NULL ||
             (hostconf = find_hostconf(req->conn->hosts, req->input.authority, req->input.scheme->default_port,
                                       &req->authority_wildcard_match)) == NULL)
             hostconf = find_default_hostconf(req->conn->hosts);
     } else {
-        /* set the authority name to the default one */
         hostconf = find_default_hostconf(req->conn->hosts);
         req->input.authority = hostconf->authority.hostport;
     }
@@ -150,8 +149,10 @@ h2o_hostconf_t *h2o_req_setup(h2o_req_t *req)
     req->method = req->input.method;
     req->authority = req->input.authority;
     req->path = req->input.path;
-    req->path_normalized =
-        h2o_url_normalize_path(&req->pool, req->input.path.base, req->input.path.len, &req->query_at, &req->norm_indexes);
+    int has_null_char;
+    req->path_normalized = h2o_url_normalize_path(&req->pool, req->input.path.base, req->input.path.len, &req->query_at,
+                                                  &req->norm_indexes, &has_null_char);
+    req->path_normalized_has_null_char = has_null_char;
     req->input.query_at = req->query_at; /* we can do this since input.path == path */
 
     return hostconf;
@@ -162,12 +163,23 @@ static void call_handlers(h2o_req_t *req, h2o_handler_t **handler)
     h2o_handler_t **end = req->pathconf->handlers.entries + req->pathconf->handlers.size;
 
     for (; handler != end; ++handler) {
-        req->handler = *handler;
-        if ((*handler)->on_req(*handler, req) == 0)
+        /* A handler that does not support request streaming cannot process a request that has been submitted before the entire
+         * request body is received (i.e., `proceed_req` is set). In such case, return the request to the protocol handler, which
+         * calls `h2o_process_request` again once the entire request body is received. Tunnel requests are dispatched immediately,
+         * as there is no request body; what follows is the payload of the tunnel. Requests being delegated or reprocessed have
+         * `req->dispatched` set, as they have already been dispatched to a handler that might have consumed part of the request
+         * body. */
+        if (!(*handler)->supports_request_streaming && !req->dispatched && req->proceed_req != NULL && !req->is_tunnel_req)
             return;
+        req->handler = *handler;
+        if ((*handler)->on_req(*handler, req) == 0) {
+            req->dispatched = 1;
+            return;
+        }
     }
 
-    h2o_send_error_404(req, "File Not Found", "not found", 0);
+    req->dispatched = 1;
+    h2o_send_error_404(req, "Not Found", "not found", 0);
 }
 
 static void setup_pathconf(h2o_req_t *req, h2o_hostconf_t *hostconf)
@@ -269,7 +281,7 @@ void h2o_init_request(h2o_req_t *req, h2o_conn_t *conn, h2o_req_t *src)
     req->preferred_chunk_size = SIZE_MAX;
     req->content_length = SIZE_MAX;
     req->remaining_delegations = conn == NULL ? 0 : conn->ctx->globalconf->max_delegations;
-    req->remaining_reprocesses = 5;
+    req->remaining_reprocesses = conn == NULL ? 0 : conn->ctx->globalconf->max_reprocesses;
     req->error_log_delegate.cb = on_default_error_callback;
     req->error_log_delegate.data = req;
 
@@ -328,9 +340,8 @@ void h2o_dispose_request(h2o_req_t *req)
 
     h2o_timer_unlink(&req->_timeout_entry);
 
-    if (req->pathconf != NULL) {
-        h2o_logger_t **logger = req->loggers, **end = logger + req->num_loggers;
-        for (; logger != end; ++logger) {
+    if (req->pathconf != NULL && req->num_loggers != 0) {
+        for (h2o_logger_t **logger = req->loggers, **end = logger + req->num_loggers; logger != end; ++logger) {
             (*logger)->log_access((*logger), req);
         }
     }
@@ -341,17 +352,34 @@ void h2o_dispose_request(h2o_req_t *req)
     h2o_mem_clear_pool(&req->pool);
 }
 
+int h2o_req_validate_pseudo_headers(h2o_req_t *req)
+{
+    if (h2o_memis(req->input.method.base, req->input.method.len, H2O_STRLIT("CONNECT-UDP"))) {
+        /* The draft requires "masque" in `:scheme` but we need to support clients that put "https" there instead. */
+        if (req->input.scheme != &H2O_URL_SCHEME_MASQUE && req->input.scheme != &H2O_URL_SCHEME_HTTPS)
+            return 0;
+        if (!h2o_memis(req->input.path.base, req->input.path.len, H2O_STRLIT("/")))
+            return 0;
+    } else {
+        if (req->input.scheme == &H2O_URL_SCHEME_MASQUE)
+            return 0;
+    }
+
+    return 1;
+}
+
 h2o_handler_t *h2o_get_first_handler(h2o_req_t *req)
 {
-    h2o_hostconf_t *hostconf = h2o_req_setup(req);
-    setup_pathconf(req, hostconf);
+    if (req->pathconf == NULL) {
+        h2o_hostconf_t *hostconf = h2o_req_setup(req);
+        setup_pathconf(req, hostconf);
+    }
     return req->pathconf->handlers.size != 0 ? req->pathconf->handlers.entries[0] : NULL;
 }
 
 void h2o_process_request(h2o_req_t *req)
 {
-    assert(!req->process_called);
-    req->process_called = 1;
+    assert(!req->dispatched);
 
     if (req->pathconf == NULL) {
         h2o_hostconf_t *hostconf = h2o_req_setup(req);
@@ -411,7 +439,10 @@ void h2o_reprocess_request(h2o_req_t *req, h2o_iovec_t method, const h2o_url_sch
     req->scheme = scheme;
     req->authority = authority;
     req->path = path;
-    req->path_normalized = h2o_url_normalize_path(&req->pool, req->path.base, req->path.len, &req->query_at, &req->norm_indexes);
+    int has_null_char;
+    req->path_normalized =
+        h2o_url_normalize_path(&req->pool, req->path.base, req->path.len, &req->query_at, &req->norm_indexes, &has_null_char);
+    req->path_normalized_has_null_char = has_null_char;
     req->authority_wildcard_match = h2o_iovec_init(NULL, 0);
     req->overrides = overrides;
     req->res_is_delegated |= is_delegated;
@@ -496,40 +527,16 @@ void h2o_start_response(h2o_req_t *req, h2o_generator_t *generator)
     assert(req->_generator == NULL);
     req->_generator = generator;
 
-    /* setup response filters */
-    if (req->prefilters != NULL) {
-        req->prefilters->on_setup_ostream(req->prefilters, req, &req->_ostr_top);
+    if (req->is_tunnel_req && (req->res.status == 101 || req->res.status == 200)) {
+        /* a tunnel has been established; forward response as is */
     } else {
-        h2o_setup_next_ostream(req, &req->_ostr_top);
+        /* setup response filters */
+        if (req->prefilters != NULL) {
+            req->prefilters->on_setup_ostream(req->prefilters, req, &req->_ostr_top);
+        } else {
+            h2o_setup_next_ostream(req, &req->_ostr_top);
+        }
     }
-}
-
-void h2o_sendvec_init_raw(h2o_sendvec_t *vec, const void *base, size_t len)
-{
-    static const h2o_sendvec_callbacks_t callbacks = {h2o_sendvec_flatten_raw};
-    vec->callbacks = &callbacks;
-    vec->raw = (char *)base;
-    vec->len = len;
-}
-
-static void sendvec_immutable_update_refcnt(h2o_sendvec_t *vec, h2o_req_t *req, int is_incr)
-{
-    /* noop */
-}
-
-void h2o_sendvec_init_immutable(h2o_sendvec_t *vec, const void *base, size_t len)
-{
-    static const h2o_sendvec_callbacks_t callbacks = {h2o_sendvec_flatten_raw, sendvec_immutable_update_refcnt};
-    vec->callbacks = &callbacks;
-    vec->raw = (char *)base;
-    vec->len = len;
-}
-
-int h2o_sendvec_flatten_raw(h2o_sendvec_t *src, h2o_req_t *req, h2o_iovec_t dst, size_t off)
-{
-    assert(off + dst.len <= src->len);
-    memcpy(dst.base, src->raw + off, dst.len);
-    return 1;
 }
 
 static void do_sendvec(h2o_req_t *req, h2o_sendvec_t *bufs, size_t bufcnt, h2o_send_state_t state)
@@ -555,7 +562,7 @@ void h2o_send(h2o_req_t *req, h2o_iovec_t *bufs, size_t bufcnt, h2o_send_state_t
 
 void h2o_sendvec(h2o_req_t *req, h2o_sendvec_t *bufs, size_t bufcnt, h2o_send_state_t state)
 {
-    assert(bufcnt == 0 || (bufs[0].callbacks->flatten == &h2o_sendvec_flatten_raw || bufcnt == 1));
+    assert(bufcnt == 0 || (bufs[0].callbacks->read_ == &h2o_sendvec_read_raw || bufcnt == 1));
     do_sendvec(req, bufs, bufcnt, state);
 }
 
@@ -580,12 +587,12 @@ h2o_ostream_t *h2o_add_ostream(h2o_req_t *req, size_t alignment, size_t sz, h2o_
     return ostr;
 }
 
-static void apply_env(h2o_req_t *req, h2o_envconf_t *env)
+void h2o_req_apply_env(h2o_req_t *req, h2o_envconf_t *env)
 {
     size_t i;
 
     if (env->parent != NULL)
-        apply_env(req, env->parent);
+        h2o_req_apply_env(req, env->parent);
     for (i = 0; i != env->unsets.size; ++i)
         h2o_req_unsetenv(req, env->unsets.entries[i].base, env->unsets.entries[i].len);
     for (i = 0; i != env->sets.size; i += 2)
@@ -604,7 +611,7 @@ void h2o_req_bind_conf(h2o_req_t *req, h2o_hostconf_t *hostconf, h2o_pathconf_t 
     req->num_loggers = pathconf->_loggers.size;
 
     if (pathconf->env != NULL)
-        apply_env(req, pathconf->env);
+        h2o_req_apply_env(req, pathconf->env);
 }
 
 void h2o_proceed_response_deferred(h2o_req_t *req)
@@ -660,6 +667,11 @@ void h2o_send_error_generic(h2o_req_t *req, int status, const char *reason, cons
         h2o_req_bind_conf(req, hostconf, &hostconf->fallback_path);
     }
 
+    /* If the request is broken or incomplete, do not apply filters, as it would be dangerous to do so. Legitimate clients would not
+     * send broken requests, so we do not need to decorate error responses using errordoc handler or anything else. */
+    if ((flags & H2O_SEND_ERROR_BROKEN_REQUEST) != 0)
+        req->_next_filter_index = SIZE_MAX;
+
     if ((flags & H2O_SEND_ERROR_HTTP1_CLOSE_CONNECTION) != 0)
         req->http1_is_persistent = 0;
 
@@ -678,23 +690,37 @@ void h2o_send_error_generic(h2o_req_t *req, int status, const char *reason, cons
 #define DECL_SEND_ERROR_DEFERRED(status_)                                                                                          \
     static void send_error_deferred_cb_##status_(h2o_timer_t *entry)                                                               \
     {                                                                                                                              \
-        struct st_send_error_deferred_t *args = H2O_STRUCT_FROM_MEMBER(struct st_send_error_deferred_t, _timeout, entry);          \
-        reset_response(args->req);                                                                                                 \
-        args->req->conn->ctx->emitted_error_status[H2O_STATUS_ERROR_##status_]++;                                                  \
-        h2o_send_error_generic(args->req, args->status, args->reason, args->body, args->flags);                                    \
+        struct st_send_error_deferred_t *args = H2O_STRUCT_FROM_MEMBER(struct st_send_error_deferred_t, super.timeout, entry);     \
+        reset_response(args->super.req);                                                                                           \
+        args->super.req->conn->ctx->emitted_error_status[H2O_STATUS_ERROR_##status_]++;                                            \
+        h2o_send_error_generic(args->super.req, args->status, args->reason, args->body, args->flags);                              \
     }                                                                                                                              \
                                                                                                                                    \
     static void h2o_send_error_deferred_##status_(h2o_req_t *req, const char *reason, const char *body, int flags)                 \
     {                                                                                                                              \
-        struct st_send_error_deferred_t *args = h2o_mem_alloc_pool(&req->pool, *args, 1);                                          \
-        *args = (struct st_send_error_deferred_t){req, status_, reason, body, flags};                                              \
-        h2o_timer_init(&args->_timeout, send_error_deferred_cb_##status_);                                                         \
-        h2o_timer_link(req->conn->ctx->loop, 0, &args->_timeout);                                                                  \
+        struct st_send_error_deferred_t *args =                                                                                    \
+            (struct st_send_error_deferred_t *)create_deferred_action(req, sizeof(*args), send_error_deferred_cb_##status_);       \
+        args->status = status_;                                                                                                    \
+        args->reason = reason;                                                                                                     \
+        args->body = body;                                                                                                         \
+        args->flags = flags;                                                                                                       \
     }
 
 DECL_SEND_ERROR_DEFERRED(502)
 
 #undef DECL_SEND_ERROR_DEFERRED
+
+static size_t append_with_limit(char *dst, h2o_iovec_t input, size_t limit)
+{
+    if (input.len < limit) {
+        h2o_memcpy(dst, input.base, input.len);
+        return input.len;
+    } else {
+        memcpy(dst, input.base, (limit - 3));
+        memcpy(dst + (limit - 3), "...", 3);
+        return limit;
+    }
+}
 
 void h2o_req_log_error(h2o_req_t *req, const char *module, const char *fmt, ...)
 {
@@ -719,17 +745,11 @@ void h2o_req_log_error(h2o_req_t *req, const char *module, const char *fmt, ...)
 #undef INITIAL_BUF_SIZE
 
     /* build prefix */
-    char *pbuf = h2o_mem_alloc_pool(&req->pool, char, sizeof("[] in request::") + 32 + strlen(module)), *p = pbuf;
+    char *pbuf = h2o_mem_alloc_pool(&req->pool, char, sizeof("[] in request::") + strlen(module) + 64 + 32);
+    char *p = pbuf;
     p += sprintf(p, "[%s] in request:", module);
-    if (req->path.len < 32) {
-        memcpy(p, req->path.base, req->path.len);
-        p += req->path.len;
-    } else {
-        memcpy(p, req->path.base, 29);
-        p += 29;
-        memcpy(p, "...", 3);
-        p += 3;
-    }
+    p += append_with_limit(p, req->authority, 64);
+    p += append_with_limit(p, req->path, 32);
     *p++ = ':';
     h2o_iovec_t prefix = h2o_iovec_init(pbuf, p - pbuf);
 
@@ -776,7 +796,7 @@ void h2o_send_redirect_internal(h2o_req_t *req, h2o_iovec_t method, const char *
     h2o_url_t url;
 
     /* parse the location URL */
-    if (h2o_url_parse_relative(url_str, url_len, &url) != 0) {
+    if (h2o_url_parse_relative(&req->pool, url_str, url_len, &url) != 0) {
         /* TODO log h2o_error_printf("[proxy] cannot handle location header: %.*s\n", (int)url_len, url); */
         h2o_send_error_deferred_502(req, "Gateway Error", "internal error", 0);
         return;
@@ -877,7 +897,7 @@ int h2o_req_resolve_internal_redirect_url(h2o_req_t *req, h2o_iovec_t dest, h2o_
     h2o_url_t input;
 
     /* resolve the URL */
-    if (h2o_url_parse_relative(dest.base, dest.len, &input) != 0) {
+    if (h2o_url_parse_relative(&req->pool, dest.base, dest.len, &input) != 0) {
         return -1;
     }
     if (input.scheme != NULL && input.authority.base != NULL) {

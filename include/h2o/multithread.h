@@ -113,8 +113,8 @@ h2o_loop_t *h2o_multithread_get_loop(h2o_multithread_queue_t *);
 #define H2O_MULTITHREAD_ONCE(block)                                                                                                \
     do {                                                                                                                           \
         static volatile int lock = 0;                                                                                              \
-        int lock_loaded = lock;                                                                                                    \
-        __sync_synchronize();                                                                                                      \
+        int lock_loaded;                                                                                                           \
+        __atomic_load(&lock, &lock_loaded, __ATOMIC_ACQUIRE);                                                                      \
         if (!lock_loaded) {                                                                                                        \
             static pthread_mutex_t mutex = PTHREAD_MUTEX_INITIALIZER;                                                              \
             pthread_mutex_lock(&mutex);                                                                                            \
@@ -122,8 +122,7 @@ h2o_loop_t *h2o_multithread_get_loop(h2o_multithread_queue_t *);
                 do {                                                                                                               \
                     block                                                                                                          \
                 } while (0);                                                                                                       \
-                __sync_synchronize();                                                                                              \
-                lock = 1;                                                                                                          \
+                __atomic_store_n(&lock, 1, __ATOMIC_RELEASE);                                                                      \
             }                                                                                                                      \
             pthread_mutex_unlock(&mutex);                                                                                          \
         }                                                                                                                          \
@@ -135,15 +134,14 @@ void h2o_sem_wait(h2o_sem_t *sem);
 void h2o_sem_post(h2o_sem_t *sem);
 void h2o_sem_set_capacity(h2o_sem_t *sem, ssize_t new_capacity);
 
-#define H2O_BARRIER_INITIALIZER(count_)                                                                                            \
-    {                                                                                                                              \
-        PTHREAD_MUTEX_INITIALIZER, PTHREAD_COND_INITIALIZER, count_                                                                \
-    }
 void h2o_barrier_init(h2o_barrier_t *barrier, size_t count);
-int h2o_barrier_wait(h2o_barrier_t *barrier);
+/**
+ * Waits for all threads to enter the barrier.
+ */
+void h2o_barrier_wait(h2o_barrier_t *barrier);
 int h2o_barrier_done(h2o_barrier_t *barrier);
 void h2o_barrier_add(h2o_barrier_t *barrier, size_t delta);
-void h2o_barrier_destroy(h2o_barrier_t *barrier);
+void h2o_barrier_dispose(h2o_barrier_t *barrier);
 
 void h2o_error_reporter__on_timeout(h2o_timer_t *timer);
 #define H2O_ERROR_REPORTER_INITIALIZER(s)                                                                                          \

@@ -34,7 +34,7 @@ extern "C" {
 #define QUICLY_DEFAULT_MAX_ACK_DELAY 25 /* milliseconds */
 #define QUICLY_LOCAL_MAX_ACK_DELAY 25   /* milliseconds */
 #define QUICLY_DEFAULT_ACK_DELAY_EXPONENT 3
-#define QUICLY_LOCAL_ACK_DELAY_EXPONENT 10
+#define QUICLY_LOCAL_ACK_DELAY_EXPONENT 3
 #define QUICLY_MIN_INITIAL_DCID_LEN 8
 #define QUICLY_DEFAULT_ACTIVE_CONNECTION_ID_LIMIT 2 /* If this transport parameter is absent, a default of 2 is assumed. (18.2) */
 /**
@@ -52,9 +52,24 @@ extern "C" {
 #define QUICLY_LOSS_DEFAULT_PACKET_THRESHOLD 3
 
 #define QUICLY_DEFAULT_PACKET_TOLERANCE 2
-#define QUICLY_MAX_PACKET_TOLERANCE 100
-#define QUICLY_FIRST_ACK_FREQUENCY_PACKET_NUMBER 1000
-#define QUICLY_ACK_FREQUENCY_CWND_FRACTION 8
+#define QUICLY_MAX_PACKET_TOLERANCE 10
+#define QUICLY_FIRST_ACK_FREQUENCY_LOSS_EPISODE 4
+
+/**
+ * 2x multiplied by the scaling factor of 1024.
+ * We use of 2x during congestion avoidance, which is different from Linux using 1.25x. The rationale behind this choice is that
+ * 1.25x is not sufficiently aggressive immediately after a loss event. Following a loss event, the congestion window (CWND) is
+ * halved (i.e., beta), but the RTT remains high for one RTT and SRTT can remain high even loger, since it is a moving average
+ * adjusted with each ACK received. Consequently, if the multiplier is set to 1.25x, the calculated send rate could drop to as low
+ * as 1.25 * 1/2 = 0.625. By using a 2x multiplier, the send rate is guaranteed to become no less than that immediately before the
+ * loss event, which would have been the link throughput. (TODO evaluate if 1.25x (or 1.216 below) is actually better)
+ */
+#define QUICLY_DEFAULT_PACING_MULTIPLIER 2048
+/**
+ * 3 * ln(1.5) scaled by 1024; under a fluid model, minimum multiplier that stasifies per-CWND growth of x is
+ * `K(x) = x / (x - 1) * ln(x)`, where Cubic and ABBA both use x = 1.5.
+ */
+#define QUICLY_DEFAULT_PACING_MULTIPLIER_L4S 1246
 
 #define QUICLY_AEAD_TAG_SIZE 16
 
@@ -67,13 +82,23 @@ extern "C" {
 #define QUICLY_EPOCH_1RTT 3
 #define QUICLY_NUM_EPOCHS 4
 
-/* coexists with picotls error codes, assuming that int is at least 32-bits */
-#define QUICLY_ERROR_IS_QUIC(e) (((e) & ~0x1ffff) == 0x20000)
-#define QUICLY_ERROR_IS_QUIC_TRANSPORT(e) (((e) & ~0xffff) == 0x20000)
-#define QUICLY_ERROR_IS_QUIC_APPLICATION(e) (((e) & ~0xffff) == 0x30000)
-#define QUICLY_ERROR_GET_ERROR_CODE(e) ((uint16_t)(e))
-#define QUICLY_ERROR_FROM_TRANSPORT_ERROR_CODE(e) ((uint16_t)(e) + 0x20000)
-#define QUICLY_ERROR_FROM_APPLICATION_ERROR_CODE(e) ((uint16_t)(e) + 0x30000)
+/**
+ * Error code used by quicly. The code coalesces the following to an int64_t.
+ * * 0..0x2ff: picotls error codes (of type int)
+ * * 0x30000..0x400000000002ffff: QUIC application error codes
+ * * 0x4000000000030000..0x800000000002ffff...: QUIC protocol error codes
+ * Internal error codes should be allocated from the unused space below 0x30000 (i.e., unused space of picotls error codes);
+ * quicly itself uses 0xffxx. `quicly_error_t` is defined as a signed type so that the picotls error code space can be mapped
+ * without sign conversion.
+ */
+typedef int64_t quicly_error_t;
+
+#define QUICLY_ERROR_IS_QUIC(e) ((uint64_t)(quicly_error_t)(e) - 0x30000u < 0x8000000000000000u)
+#define QUICLY_ERROR_IS_QUIC_TRANSPORT(e) ((uint64_t)(quicly_error_t)(e) - 0x4000000000030000u < 0x4000000000000000u)
+#define QUICLY_ERROR_IS_QUIC_APPLICATION(e) ((uint64_t)(quicly_error_t)(e) - 0x30000u < 0x4000000000000000u)
+#define QUICLY_ERROR_GET_ERROR_CODE(e) (((uint64_t)(quicly_error_t)(e) - 0x30000u) & 0x3fffffffffffffffu)
+#define QUICLY_ERROR_FROM_TRANSPORT_ERROR_CODE(e) ((quicly_error_t)((uint64_t)(e) + 0x4000000000030000u))
+#define QUICLY_ERROR_FROM_APPLICATION_ERROR_CODE(e) ((quicly_error_t)(uint64_t)(e) + 0x30000)
 /**
  * PTLS_ERROR_NO_MEMORY and QUICLY_ERROR_STATE_EXHAUSTION are special error codes that are internal but can be passed to
  * quicly_close. These are converted to QUICLY_TRANSPORT_ERROR_INTERNAL when sent over the wire.
@@ -97,9 +122,9 @@ extern "C" {
 #define QUICLY_TRANSPORT_ERROR_CRYPTO_BUFFER_EXCEEDED QUICLY_ERROR_FROM_TRANSPORT_ERROR_CODE(0xd)
 #define QUICLY_TRANSPORT_ERROR_KEY_UPDATE QUICLY_ERROR_FROM_TRANSPORT_ERROR_CODE(0xe)
 #define QUICLY_TRANSPORT_ERROR_AEAD_LIMIT_REACHED QUICLY_ERROR_FROM_TRANSPORT_ERROR_CODE(0xf)
-#define QUICLY_TRANSPORT_ERROR_TLS_ALERT_BASE QUICLY_ERROR_FROM_TRANSPORT_ERROR_CODE(0x100)
+#define QUICLY_TRANSPORT_ERROR_CRYPTO(tls_alert) QUICLY_ERROR_FROM_TRANSPORT_ERROR_CODE(0x100 + (tls_alert))
 
-/* internal error codes, used purely for signaling status to the application */
+/* local error codes, used for signaling status between quicly and the application */
 #define QUICLY_ERROR_PACKET_IGNORED 0xff01
 #define QUICLY_ERROR_SENDBUF_FULL 0xff02    /* internal use only; the error code is never exposed to the application */
 #define QUICLY_ERROR_FREE_CONNECTION 0xff03 /* returned by quicly_send when the connection is freeable */

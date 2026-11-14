@@ -28,11 +28,15 @@ extern "C" {
 
 #include <stdint.h>
 #include <sys/socket.h>
+#include <time.h>
+#ifdef __linux__
+#include <linux/errqueue.h>
+#endif
 #include <openssl/ssl.h>
 #include <openssl/opensslconf.h>
 #include "picotls.h"
+#include "picotls/openssl.h" /* for H2O_CAN_OSSL_ASYNC */
 #include "h2o/cache.h"
-#include "h2o/ebpf.h"
 #include "h2o/memory.h"
 #include "h2o/openssl_backport.h"
 #include "h2o/string_.h"
@@ -43,6 +47,10 @@ extern "C" {
 #else
 #define H2O_USE_LIBUV 1
 #endif
+#endif
+
+#if defined(SO_ZEROCOPY) && defined(SO_EE_ORIGIN_ZEROCOPY) && defined(MSG_ZEROCOPY)
+#define H2O_USE_MSG_ZEROCOPY 1
 #endif
 
 #if OPENSSL_VERSION_NUMBER >= 0x10002000L
@@ -59,6 +67,24 @@ extern "C" {
 #define H2O_USE_ALPN 0
 #define H2O_USE_NPN 0
 #endif
+
+#if !defined(LIBRESSL_VERSION_NUMBER) && !defined(OPENSSL_IS_BORINGSSL) && OPENSSL_VERSION_NUMBER >= 0x1010100fL
+#define H2O_USE_OPENSSL_CLIENT_HELLO_CB 1
+#endif
+#if PTLS_OPENSSL_HAVE_ASYNC && H2O_USE_OPENSSL_CLIENT_HELLO_CB
+#define H2O_CAN_OSSL_ASYNC 1
+#endif
+
+/**
+ * Maximum size of sendvec when a pull (i.e. non-raw) vector is used. Note also that bufcnt must be set to one when a pull mode
+ * vector is used.
+ */
+#define H2O_PULL_SENDVEC_MAX_SIZE 65536
+/**
+ * Maximum amount of TLS records to generate at once. Default is 4 full-sized TLS records using 32-byte tag. This value is defined
+ * to be slightly greater than H2O_PULL_SENDVEC_MAX_SIZE, so that the two buffers can recycle the same memory buffers.
+ */
+#define H2O_SOCKET_DEFAULT_SSL_BUFFER_SIZE ((5 + 16384 + 32) * 4)
 
 typedef struct st_h2o_sliding_counter_t {
     uint64_t average;
@@ -85,6 +111,15 @@ typedef struct st_h2o_socket_t h2o_socket_t;
 
 typedef void (*h2o_socket_cb)(h2o_socket_t *sock, const char *err);
 
+/**
+ * When set, successful write progress may be reported by invoking the write callback with
+ * h2o_socket_error_write_progress. The write remains inflight until the callback is invoked with NULL or an error.
+ */
+#define H2O_SOCKET_SENDVEC_FLAG_REPORT_PROGRESS 0x1
+
+/* used by probes */
+struct st_h2o_io_uring_cmd_t;
+
 #if H2O_USE_LIBUV
 #include "socket/uv-binding.h"
 #else
@@ -103,6 +138,48 @@ enum {
     H2O_SOCKET_LATENCY_OPTIMIZATION_STATE_DETERMINED
 };
 
+typedef struct st_h2o_sendvec_t h2o_sendvec_t;
+
+/**
+ * Callbacks of `h2o_sendvec_t`. Random access capability has been removed. `read_` and `send_` only provide one-pass sequential
+ * access. Properties of `h2o_sendvec_t` (e.g., `len`, `raw`) are adjusted as bytes are read / sent from the vector.
+ */
+typedef struct st_h2o_sendvec_callbacks_t {
+    /**
+     * Mandatory callback used to load the bytes held by the vector. Returns if the operation succeeded. When false is returned, the
+     * generator is considered as been error-closed by itself.  If the callback is `h2o_sendvec_read_raw`, the data is available as
+     * raw bytes in `h2o_sendvec_t::raw`.
+     */
+    int (*read_)(h2o_sendvec_t *vec, void *dst, size_t len);
+    /**
+     * Optional callback for sending contents of a vector directly to a socket. Returns number of bytes being sent (could be zero),
+     * or, upon error, SIZE_MAX.
+     */
+    size_t (*send_)(h2o_sendvec_t *vec, int sockfd, size_t len);
+} h2o_sendvec_callbacks_t;
+
+/**
+ * send vector. Unlike an ordinary `h2o_iovec_t`, the vector has a callback that allows the sender to delay the flattening of data
+ * until it becomes necessary.
+ */
+struct st_h2o_sendvec_t {
+    /**
+     *
+     */
+    const h2o_sendvec_callbacks_t *callbacks;
+    /**
+     * size of the vector
+     */
+    size_t len;
+    /**
+     *
+     */
+    union {
+        char *raw;
+        uint64_t cb_arg[2];
+    };
+};
+
 /**
  * abstraction layer for sockets (SSL vs. TCP)
  */
@@ -119,9 +196,10 @@ struct st_h2o_socket_t {
      */
     uint64_t bytes_written;
     /**
-     * boolean flag to indicate if sock is NOT being traced
+     * trace state; when picotls is used as the TLS stack, this state is duplicated to that of picotls to achieve consistent
+     * behavior across layers
      */
-    unsigned _skip_tracing : 1;
+    ptls_log_conn_state_t _log_state;
     struct {
         void (*cb)(void *data);
         void *data;
@@ -129,15 +207,26 @@ struct st_h2o_socket_t {
     struct {
         h2o_socket_cb read;
         h2o_socket_cb write;
+        unsigned write_flags;
     } _cb;
     struct st_h2o_socket_addr_t *_peername;
     struct st_h2o_socket_addr_t *_sockname;
     struct {
+        size_t cnt;
+        h2o_iovec_t *bufs;
+        union {
+            h2o_iovec_t *alloced_ptr;
+            h2o_iovec_t smallbufs[4];
+        };
+        char *flattened;
+    } _write_buf;
+    struct {
         uint8_t state; /* one of H2O_SOCKET_LATENCY_STATE_* */
         uint8_t notsent_is_minimized : 1;
         size_t suggested_tls_payload_size; /* suggested TLS record payload size, or SIZE_MAX when no need to restrict */
-        size_t suggested_write_size; /* SIZE_MAX if no need to optimize for latency */
+        size_t suggested_write_size;       /* SIZE_MAX if no need to optimize for latency */
     } _latency_optimization;
+    struct st_h2o_socket_zerocopy_buffers_t *_zerocopy;
 };
 
 typedef struct st_h2o_socket_export_t {
@@ -169,17 +258,36 @@ typedef void (*h2o_socket_ssl_resumption_new_cb)(h2o_socket_t *sock, h2o_iovec_t
 typedef void (*h2o_socket_ssl_resumption_remove_cb)(h2o_iovec_t session_id);
 
 extern h2o_buffer_mmap_settings_t h2o_socket_buffer_mmap_settings;
-extern __thread h2o_buffer_prototype_t h2o_socket_buffer_prototype;
+extern h2o_buffer_prototype_t h2o_socket_buffer_prototype;
+
+/**
+ * see H2O_SOCKET_DEFAULT_SSL_BUFFER_SIZE
+ */
+extern h2o_mem_recycle_conf_t h2o_socket_ssl_buffer_conf;
+extern __thread h2o_mem_recycle_t h2o_socket_ssl_buffer_allocator;
+extern __thread h2o_mem_recycle_t h2o_socket_zerocopy_buffer_allocator;
+extern __thread size_t h2o_socket_num_zerocopy_buffers_inflight;
+
+/**
+ * boolean flag indicating if kTLS should be used (when preferable)
+ */
+extern int h2o_socket_use_ktls;
 
 extern const char h2o_socket_error_out_of_memory[];
 extern const char h2o_socket_error_io[];
 extern const char h2o_socket_error_closed[];
 extern const char h2o_socket_error_conn_fail[];
+extern const char h2o_socket_error_conn_refused[];
+extern const char h2o_socket_error_conn_timed_out[];
+extern const char h2o_socket_error_network_unreachable[];
+extern const char h2o_socket_error_host_unreachable[];
+extern const char h2o_socket_error_socket_fail[];
 extern const char h2o_socket_error_ssl_no_cert[];
 extern const char h2o_socket_error_ssl_cert_invalid[];
 extern const char h2o_socket_error_ssl_cert_name_mismatch[];
 extern const char h2o_socket_error_ssl_decode[];
 extern const char h2o_socket_error_ssl_handshake[];
+extern const char h2o_socket_error_write_progress[];
 
 /**
  * returns the loop
@@ -202,7 +310,7 @@ void h2o_socket_dispose_export(h2o_socket_export_t *info);
  */
 void h2o_socket_close(h2o_socket_t *sock);
 /**
- * Schedules a callback to be notify we the socket can be written to
+ * Schedules a callback that would be invoked when the socket becomes immediately writable
  */
 void h2o_socket_notify_write(h2o_socket_t *sock, h2o_socket_cb cb);
 /**
@@ -218,7 +326,7 @@ void h2o_socket_dont_read(h2o_socket_t *sock, int dont_read);
 /**
  * connects to peer
  */
-h2o_socket_t *h2o_socket_connect(h2o_loop_t *loop, struct sockaddr *addr, socklen_t addrlen, h2o_socket_cb cb);
+h2o_socket_t *h2o_socket_connect(h2o_loop_t *loop, struct sockaddr *addr, socklen_t addrlen, h2o_socket_cb cb, const char **err);
 /**
  * prepares for latency-optimized write and returns the number of octets that should be written, or SIZE_MAX if failed to prepare
  */
@@ -234,6 +342,18 @@ size_t h2o_socket_do_prepare_for_latency_optimized_write(h2o_socket_t *sock,
  * @param cb callback to be called when write is complete
  */
 void h2o_socket_write(h2o_socket_t *sock, h2o_iovec_t *bufs, size_t bufcnt, h2o_socket_cb cb);
+/**
+ *
+ */
+/**
+ * writes given sendvecs to socket
+ * @param sock the socket
+ * @param bufs an array of sendvecs
+ * @param bufcnt length of the sendvec array
+ * @param flags optional H2O_SOCKET_SENDVEC_FLAG_* flags
+ * @param cb callback to be called when write is complete
+ */
+void h2o_socket_sendvec(h2o_socket_t *sock, h2o_sendvec_t *bufs, size_t bufcnt, unsigned flags, h2o_socket_cb cb);
 /**
  * starts polling on the socket (for read) and calls given callback when data arrives
  * @param sock the socket
@@ -276,6 +396,10 @@ ptls_t *h2o_socket_get_ptls(h2o_socket_t *sock);
 /**
  *
  */
+int h2o_socket_can_tls_offload(h2o_socket_t *sock);
+/**
+ *
+ */
 h2o_iovec_t h2o_socket_log_tcp_congestion_controller(h2o_socket_t *sock, h2o_mem_pool_t *pool);
 h2o_iovec_t h2o_socket_log_tcp_delivery_rate(h2o_socket_t *sock, h2o_mem_pool_t *pool);
 const char *h2o_socket_get_ssl_protocol_version(h2o_socket_t *sock);
@@ -291,6 +415,11 @@ h2o_iovec_t h2o_socket_log_ssl_cipher_bits(h2o_socket_t *sock, h2o_mem_pool_t *p
 h2o_iovec_t h2o_socket_log_ssl_session_id(h2o_socket_t *sock, h2o_mem_pool_t *pool);
 static h2o_iovec_t h2o_socket_log_ssl_server_name(h2o_socket_t *sock, h2o_mem_pool_t *pool);
 static h2o_iovec_t h2o_socket_log_ssl_negotiated_protocol(h2o_socket_t *sock, h2o_mem_pool_t *pool);
+h2o_iovec_t h2o_socket_log_ssl_ech_config_id(h2o_socket_t *sock, h2o_mem_pool_t *pool);
+h2o_iovec_t h2o_socket_log_ssl_ech_kem(h2o_socket_t *sock, h2o_mem_pool_t *pool);
+h2o_iovec_t h2o_socket_log_ssl_ech_cipher(h2o_socket_t *sock, h2o_mem_pool_t *pool);
+h2o_iovec_t h2o_socket_log_ssl_ech_cipher_bits(h2o_socket_t *sock, h2o_mem_pool_t *pool);
+h2o_iovec_t h2o_socket_log_ssl_backend(h2o_socket_t *sock, h2o_mem_pool_t *pool);
 int h2o_socket_ssl_new_session_cb(SSL *s, SSL_SESSION *sess);
 
 /**
@@ -305,6 +434,10 @@ size_t h2o_socket_getnumerichost(const struct sockaddr *sa, socklen_t salen, cha
  * returns the port number, or -1 if failed
  */
 int32_t h2o_socket_getport(const struct sockaddr *sa);
+/**
+ * converts given error number to string representation if known, otherwise returns `default_err`
+ */
+const char *h2o_socket_get_error_string(int errnum, const char *default_err);
 /**
  * performs SSL handshake on a socket
  * @param sock the socket
@@ -370,38 +503,63 @@ void h2o_ssl_register_npn_protocols(SSL_CTX *ctx, const char *protocols);
  */
 int h2o_socket_set_df_bit(int fd, int domain);
 /**
- * helper to check if socket the socket is target of tracing
+ * returns trace state
  */
-static int h2o_socket_skip_tracing(h2o_socket_t *sock);
+static ptls_log_conn_state_t *h2o_socket_log_state(h2o_socket_t *sock);
+
+#if H2O_CAN_OSSL_ASYNC
+/**
+ * When generating a TLS handshake signature asynchronously, it is necessary to wait for a notification on a file descriptor at
+ * which point the TLS handshake machinery is to be resumed. This function sets up a callback that would be called when that
+ * notification is received. The callback must invoke `h2o_socket_async_handshake_on_notify` to do the necessary clean up, as well
+ * as obtain the `data` pointer it has supplied.
+ */
+void h2o_socket_start_async_handshake(h2o_loop_t *loop, int async_fd, void *data, h2o_socket_cb cb);
+/**
+ * The function to be called by the callback supplied to `h2o_socket_start_async_handshake`. It returns the `data` pointer supplied
+ * to `h2o_socket_start_async_handshake`.
+ */
+void *h2o_socket_async_handshake_on_notify(h2o_socket_t *async_sock, const char *err);
+#endif
+
+/**
+ * Initializes a send vector that refers to mutable memory region. When the `proceed` callback is invoked, it is possible for the
+ * generator to reuse (or release) that memory region.
+ */
+void h2o_sendvec_init_raw(h2o_sendvec_t *vec, const void *base, size_t len);
 /**
  *
  */
-void h2o_socket_set_skip_tracing(h2o_socket_t *sock, int skip_tracing);
+int h2o_sendvec_read_raw(h2o_sendvec_t *vec, void *dst, size_t len);
 
 /**
- * Prepares eBPF maps. Requires root privileges and thus should be called before dropping the privileges. Returns a boolean
- * indicating if operation succeeded.
+ * GC resources
  */
-int h2o_socket_ebpf_setup(void);
-/**
- * Function to lookup if the connection is tagged for special treatment. The result is a union of `H2O_EBPF_FLAGS_*`.
- */
-uint64_t h2o_socket_ebpf_lookup_flags(h2o_loop_t *loop, int (*init_key)(h2o_ebpf_map_key_t *key, void *cbdata), void *cbdata);
+void h2o_socket_clear_recycle(int full);
 /**
  *
  */
-uint64_t h2o_socket_ebpf_lookup_flags_sni(h2o_loop_t *loop, uint64_t flags, const char *server_name, size_t server_name_len);
-/**
- * function for initializing the ebpf lookup key from raw information
- */
-int h2o_socket_ebpf_init_key_raw(h2o_ebpf_map_key_t *key, int sock_type, struct sockaddr *local, struct sockaddr *remote);
-/**
- * callback for initializing the ebpf lookup key from `h2o_socket_t`
- */
-int h2o_socket_ebpf_init_key(h2o_ebpf_map_key_t *key, void *sock);
+int h2o_socket_recycle_is_empty(void);
 
-void h2o_socket__write_pending(h2o_socket_t *sock);
-void h2o_socket__write_on_complete(h2o_socket_t *sock, int status);
+/**
+ * This is a thin wrapper around sendfile (2) that hides the differences between various OS implementations.
+ * @return number of bytes written (zero is a valid value indicating that the send buffer is full), or SIZE_MAX on error
+ */
+size_t h2o_sendfile(int sockfd, int filefd, off_t off, size_t len);
+
+#ifdef OPENSSL_IS_BORINGSSL
+/**
+ * returns SSL_[gs]et_ext_data slot used to store `ptls_async_job_t` for handling async TLS handshake signature generation
+ */
+int h2o_socket_boringssl_get_async_job_index(void);
+/**
+ * If async resumption is in flight. When true is returned the TLS handshake is going to be discarded, and therefore the async
+ * signature calculation callback should return failure rather than starting the calculation.
+ */
+int h2o_socket_boringssl_async_resumption_in_flight(SSL *ssl);
+#endif
+
+PTLS_LOG_DEFINE_GETSNI(h2o_sock, h2o_socket_t *, { return h2o_socket_get_ssl_server_name(arg); })
 
 /* inline defs */
 
@@ -477,9 +635,9 @@ inline void h2o_sliding_counter_start(h2o_sliding_counter_t *counter, uint64_t n
     counter->cur.start_at = now;
 }
 
-inline int h2o_socket_skip_tracing(h2o_socket_t *sock)
+inline ptls_log_conn_state_t *h2o_socket_log_state(h2o_socket_t *sock)
 {
-    return sock->_skip_tracing;
+    return &sock->_log_state;
 }
 
 #ifdef __cplusplus

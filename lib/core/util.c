@@ -226,6 +226,11 @@ static h2o_iovec_t build_redis_value(h2o_iovec_t session_data)
 static void redis_resumption_on_get(redisReply *reply, void *_accept_data, const char *errstr)
 {
     struct st_h2o_redis_resumption_accept_data_t *accept_data = _accept_data;
+
+    /* Being called while `get_command` is NULL means that `h2o_redis_command` failed synchronously, i.e., while the handshake is
+     * in progress. As the connection is in the connected state, that happens only when hiredis fails to allocate memory. */
+    if (accept_data->get_command == NULL)
+        h2o_fatal("no memory");
     accept_data->get_command = NULL;
 
     h2o_iovec_t session_data;
@@ -486,12 +491,17 @@ static void on_read_proxy_line(h2o_socket_t *sock, const char *err)
 
     struct sockaddr_storage addr;
     socklen_t addrlen;
-    ssize_t r = parse_proxy_line(sock->input->bytes, sock->input->size, (void *)&addr, &addrlen);
+    /* PROXY v1 line is at most 107 bytes including CRLF (section 2.1 of the spec) */
+    static const size_t max_line_len = 107;
+    ssize_t r = parse_proxy_line(sock->input->bytes, sock->input->size < max_line_len ? sock->input->size : max_line_len,
+                                 (void *)&addr, &addrlen);
     switch (r) {
     case -1: /* error, just pass the input to the next handler */
         break;
     case -2: /* incomplete */
-        return;
+        if (sock->input->size < max_line_len)
+            return;
+        break; /* CRLF not found within the max length, pass the input to the next handler */
     default:
         h2o_buffer_consume(&sock->input, r);
         if (addrlen != 0)
@@ -600,7 +610,7 @@ static h2o_iovec_t to_push_path(h2o_mem_pool_t *pool, h2o_iovec_t url, h2o_iovec
     h2o_url_t parsed, resolved;
 
     /* check the authority, and extract absolute path */
-    if (h2o_url_parse_relative(url.base, url.len, &parsed) != 0)
+    if (h2o_url_parse_relative(pool, url.base, url.len, &parsed) != 0)
         goto Invalid;
 
     /* fast-path for abspath form */
@@ -718,6 +728,8 @@ int h2o_get_compressible_types(const h2o_headers_t *headers)
                     compressible_types |= H2O_COMPRESSIBLE_GZIP;
                 else if (h2o_lcstris(token, token_len, H2O_STRLIT("br")))
                     compressible_types |= H2O_COMPRESSIBLE_BROTLI;
+                else if (h2o_lcstris(token, token_len, H2O_STRLIT("zstd")))
+                    compressible_types |= H2O_COMPRESSIBLE_ZSTD;
             }
         }
     }
@@ -785,14 +797,14 @@ h2o_iovec_t h2o_build_destination(h2o_req_t *req, const char *prefix, size_t pre
     return h2o_concat_list(&req->pool, parts, num_parts);
 }
 
-#define SERVER_TIMING_DURATION_LONGEST_STR "dur=" H2O_INT32_LONGEST_STR ".000"
+#define SERVER_TIMING_DURATION_LONGEST_STR "dur=" H2O_INT64_LONGEST_STR ".000"
 
 size_t stringify_duration(char *buf, int64_t usec)
 {
-    int32_t msec = (int32_t)(usec / 1000);
-    usec -= ((int64_t)msec * 1000);
+    int64_t msec = usec / 1000;
+    usec -= msec * 1000;
     char *pos = buf;
-    pos += sprintf(pos, "dur=%" PRId32, msec);
+    pos += sprintf(pos, "dur=%" PRId64, msec);
     if (usec != 0) {
         *pos++ = '.';
         int denom;
@@ -917,10 +929,7 @@ h2o_iovec_t h2o_build_server_timing_trailer(h2o_req_t *req, const char *prefix, 
 #undef DELIMITER
 
 /* h2-14 and h2-16 are kept for backwards compatibility, as they are often used */
-#define ALPN_ENTRY(s)                                                                                                              \
-    {                                                                                                                              \
-        H2O_STRLIT(s)                                                                                                              \
-    }
+#define ALPN_ENTRY(s) {H2O_STRLIT(s)}
 #define ALPN_PROTOCOLS_CORE ALPN_ENTRY("h2"), ALPN_ENTRY("h2-16"), ALPN_ENTRY("h2-14")
 #define NPN_PROTOCOLS_CORE                                                                                                         \
     "\x02"                                                                                                                         \
@@ -939,9 +948,29 @@ const char h2o_npn_protocols[] = NPN_PROTOCOLS_CORE "\x08"
 
 uint64_t h2o_connection_id = 0;
 
-void h2o_cleanup_thread(void)
+uint32_t h2o_cleanup_thread(uint64_t now, h2o_context_t *ctx_optional)
 {
-    h2o_mem_clear_recycle(&h2o_mem_pool_allocator);
-    h2o_mem_clear_recycle(&h2o_http2_wbuf_buffer_prototype.allocator);
-    h2o_mem_clear_recycle(&h2o_socket_buffer_prototype.allocator);
+    /* File descriptor cache is cleared fully per event loop and it is sufficient to do so, because:
+     * * if the file handler opens one file only once per event loop, then calling open (2) is relatively lightweight compared to
+     *   other stuff such as connection establishment, and
+     * * if a file is large enough that it is not served in one event loop, the file descriptor remains open within the cache. */
+    if (ctx_optional != NULL)
+        h2o_filecache_clear(ctx_optional->filecache);
+
+    /* recycle either fully, or partially if at least 1 second has elasped since previous gc */
+    static __thread uint64_t next_gc_at;
+    if (now >= next_gc_at) {
+        int full = now == 0;
+        h2o_buffer_clear_recycle(full);
+        h2o_socket_clear_recycle(full);
+        h2o_mem_clear_recycle(&h2o_mem_pool_allocator, full);
+        next_gc_at = now + 1000;
+    }
+
+    /* if all the recyclers are empty, we can sleep forever; otherwise request to be invoked again within no more than one second */
+    if (h2o_buffer_recycle_is_empty() && h2o_socket_recycle_is_empty() && h2o_mem_recycle_is_empty(&h2o_mem_pool_allocator)) {
+        return INT32_MAX;
+    } else {
+        return 1000;
+    }
 }

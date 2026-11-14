@@ -4,7 +4,7 @@ use IO::Socket::INET;
 use Test::More;
 use Time::HiRes qw(sleep);
 use t::Util;
-use Net::EmptyPort qw(check_port empty_port);
+use Net::EmptyPort qw(check_port);
 use File::Temp qw(tempfile);
 
 my $upstream_port = empty_port({ host => '0.0.0.0' });
@@ -59,6 +59,6 @@ like $res, qr{transfer closed with outstanding read data remaining}, "connection
 
 $conffn = build_test(8, 1);
 $res = `curl -X POST -d \@$conffn -svo /dev/null http://127.0.0.1:$port/custom-perl 2>&1 > /dev/null`;
-like $res, qr{Connection.*to host 127.0.0.1 left intact}, "connection was closed";
+like $res, qr{Connection.*to host 127\.0\.0\.1(?::\d+)? left intact}, "connection was closed";
 
 done_testing();

@@ -2,8 +2,7 @@ use strict;
 use warnings;
 use IO::Socket::INET;
 use JSON;
-use Net::EmptyPort qw(check_port empty_port);
-use Scope::Guard qw/scope_guard/;
+use Net::EmptyPort qw(check_port);
 use Time::HiRes;
 use Test::More;
 use t::Util;
@@ -58,6 +57,36 @@ EOT
         my ($status, $headers, $body) = $tester->();
         is $status, 200;
         is $body, 'cached';
+    };
+
+    subtest 'exception in arguments' => sub {
+        my ($tester, $guard) = setup(<<"EOT");
+              class RaisingToS
+                def to_s
+                  raise "raised by to_s"
+                end
+              end
+              proc {|env|
+                errors = []
+                [
+                  proc { redis.set('k1', RaisingToS.new) },
+                  proc { redis.set('k1', "a\\0b") },
+                ].each do |p|
+                  begin
+                    p.call
+                  rescue => e
+                    errors << e.message
+                  end
+                end
+                GC.start
+                redis.set('k1', 'ok')
+                errors << redis.get('k1').join
+                [200, {}, [errors.join(",")]]
+              }
+EOT
+        my ($status, $headers, $body) = $tester->();
+        is $status, 200;
+        is $body, 'raised by to_s,string contains null byte,ok';
     };
 
     subtest 'command error' => sub {
@@ -491,7 +520,7 @@ sub spawn_command_timeout_mock {
         }
     }
 
-    my $guard = scope_guard(sub { kill 'KILL', $pid; });
+    my $guard = make_guard(sub { kill 'KILL', $pid; });
     return (+{ guard => $guard }, $port);
 }
 

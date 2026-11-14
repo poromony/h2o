@@ -24,25 +24,40 @@
 {
     "receive_request_header": ["name", "value"],
     "send_response_header": ["name", "value"],
-    "h3_frame_receive": ["bytes"],
-    "tunnel_on_read": ["bytes"],
-    "tunnel_write": ["bytes"]
+    "h3_frame_receive": ["bytes"]
 }
 */
 
 provider h2o {
     /**
-     * When a new connection is accepted, h2o invokes this probe to obtain the flags to be associated to the new connection. The
-     * probe MUST write the result into the h2o_return map; see ebpf.h for details. `original_flags` contain the flags that will be
-     * associated when the probe is not attached.
-     *
-     * Do not use it for a tracing event.
+     * socket write at H2O socket abstraction layer
      */
-    probe _private_socket_lookup_flags(pid_t tid, uint64_t original_flags, struct st_h2o_ebpf_map_key_t *info);
+    probe socket_write(struct st_h2o_socket_t *sock, struct st_h2o_iovec_t *bufs, size_t bufcnt, void *cb);
     /**
-     * Same as `_private_socket_lookup_flags`, expect that this probe is invoked when SNI is being obtained.
+     * write complete
      */
-    probe _private_socket_lookup_flags_sni(pid_t tid, uint64_t original_flags, const char *server_name, size_t server_name_len);
+    probe socket_write_complete(struct st_h2o_socket_t *sock, int success);
+    /**
+     * amount of bytes being written using writev(2)
+     */
+    probe socket_writev(struct st_h2o_socket_t *sock, ssize_t ret);
+    /**
+     * amount of payload being provided to the TLS layer, as well as amount of TLS records being buffered
+     */
+    probe socket_write_tls_record(struct st_h2o_socket_t *sock, size_t write_size, size_t bytes_buffered);
+
+    /**
+     *
+     */
+    probe io_uring_splice(struct st_h2o_io_uring_cmd_t *cmd);
+    /**
+     *
+     */
+    probe io_uring_submit(struct st_h2o_io_uring_cmd_t *cmd);
+    /**
+     *
+     */
+    probe io_uring_end(struct st_h2o_io_uring_cmd_t *cmd);
 
     /**
      * HTTP-level event, indicating that a request has been received.
@@ -56,12 +71,17 @@ provider h2o {
     /**
      * HTTP-level event, indicating that a response has been sent.
      */
-    probe send_response(uint64_t conn_id, uint64_t req_id, int status, struct st_h2o_tunnel_t *tunnel);
+    probe send_response(uint64_t conn_id, uint64_t req_id, int status);
     /**
      * HTTP-level event, indicating the response header fields being sent.
      */
     probe send_response_header(uint64_t conn_id, uint64_t req_id, const char *name, size_t name_len, const char *value,
                                size_t value_len);
+    /**
+     * HTTP-level event, reporting the properties of the TLS handshake. Emitted once per connection. `server_name` is an empty string
+     * if SNI was not provided.
+     */
+    probe tls_properties(uint64_t conn_id, const char *server_name);
 
     /**
      * HTTP/1 server-level event, indicating that a connection has been accepted.
@@ -84,11 +104,22 @@ provider h2o {
     /**
      * HTTP/3 server-level event, indicating that a connection has been destroyed
      */
-    probe h3s_destroy(uint64_t conn_id);
+    probe h3s_destroy(uint64_t conn_id, uint64_t num_requests, uint64_t request_stream_bytes, uint64_t request_header_bytes,
+                      uint64_t request_body_bytes, uint64_t request_header_count, uint64_t request_header_text_bytes,
+                      uint64_t response_stream_bytes, uint64_t response_header_bytes, uint64_t response_body_bytes,
+                      uint64_t response_header_count, uint64_t response_header_text_bytes);
     /**
      * HTTP/3 server-level event, indicating that a state of a request stream has been altered
      */
     probe h3s_stream_set_state(uint64_t conn_id, uint64_t req_id, unsigned state);
+    /**
+     * HTTP/3 server-level event, indicating final per-request stream statistics
+     */
+    probe h3s_stream_stats(uint64_t conn_id, uint64_t stream_id, uint64_t request_stream_bytes,
+                           uint64_t request_header_bytes, uint64_t request_body_bytes, uint64_t request_header_count,
+                           uint64_t request_header_text_bytes, uint64_t response_stream_bytes,
+                           uint64_t response_header_bytes, uint64_t response_body_bytes, uint64_t response_header_count,
+                           uint64_t response_header_text_bytes);
 
     /**
      * HTTP/3 event, indicating that a H3 frame has been received. `bytes` is available except when frame_type is DATA.
@@ -116,16 +147,51 @@ provider h2o {
     probe h3_forwarded_packet_receive(struct sockaddr *dest, struct sockaddr *src, size_t num_bytes);
 
     /**
-     * FIXME define probes for http3client, aligning the arguments of `h2o_tunnel_create`
-     */
-    probe h3c_tunnel_create(struct st_h2o_tunnel_t *tunnel);
-
-    probe tunnel_on_destroy(struct st_h2o_tunnel_t *tunnel);
-    probe tunnel_on_read(struct st_h2o_tunnel_t *tunnel, const char *err, const void *bytes, size_t bytes_len);
-    probe tunnel_proceed_read(struct st_h2o_tunnel_t *tunnel);
-    probe tunnel_write(struct st_h2o_tunnel_t *tunnel, const void *bytes, size_t bytes_len);
-    probe tunnel_on_write_complete(struct st_h2o_tunnel_t *tunnel, const char *err);
-
-    probe socket_tunnel_create(struct st_h2o_tunnel_t *tunnel);
-    probe socket_tunnel_start(struct st_h2o_tunnel_t *tunnel, size_t bytes_to_consume);
+      * An attempt to connect on the backend-side of a CONNECT tunnel.
+      */
+    probe connect_tcp_start(uint64_t conn_id, uint64_t req_id, struct sockaddr *dest);
+    /**
+      * A write to the TCP connection on the backend-side of a CONNECT tunnel.
+      */
+    probe connect_tcp_write(uint64_t conn_id, uint64_t req_id, size_t num_bytes);
+    /**
+      * A write error on the TCP connection on the backend-side of a CONNECT tunnel.
+      */
+    probe connect_tcp_write_error(uint64_t conn_id, uint64_t req_id, const char *err);
+    /**
+      * A read from the TCP connection on the backend-side of a CONNECT tunnel.
+      */
+    probe connect_tcp_read(uint64_t conn_id, uint64_t req_id, size_t num_bytes);
+    /**
+      * A read error on the TCP connection on the backend-side of a CONNECT tunnel.
+      */
+    probe connect_tcp_read_error(uint64_t conn_id, uint64_t req_id, const char *err);
+    /**
+      * An attempt to connect on the backend-side of a CONNECT-UDP tunnel.
+      */
+    probe connect_udp_start(uint64_t conn_id, uint64_t req_id, struct sockaddr *dest);
+    /**
+      * A write to the UDP connection on the backend-side of a CONNECT-UDP tunnel.
+      */
+    probe connect_udp_write(uint64_t conn_id, uint64_t req_id, size_t num_bytes);
+    /**
+      * A read from the UDP connection on the backend-side of a CONNECT-UDP tunnel.
+      */
+    probe connect_udp_read(uint64_t conn_id, uint64_t req_id, size_t num_bytes);
+    /**
+      * Error trying to establish a CONNECT or CONNECT-UDP tunnel.
+      */
+    probe connect_error(uint64_t conn_id, uint64_t req_id, const char *error_type, const char *details, const char *rcode);
+    /**
+      * Success establishing a CONNECT or CONNECT-UDP tunnel.
+      */
+    probe connect_success(uint64_t conn_id, uint64_t req_id, struct sockaddr *dest);
+    /**
+      * Idle timeout on a CONNECT or CONNECT-UDP tunnel.
+      */
+    probe connect_io_timeout(uint64_t conn_id, uint64_t req_id);
+    /**
+      * Done handling a CONNECT or CONNECT-UDP request.
+      */
+    probe connect_dispose(uint64_t conn_id, uint64_t req_id);
 };

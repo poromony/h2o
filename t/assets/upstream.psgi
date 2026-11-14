@@ -258,10 +258,10 @@ builder {
         my $fh = $env->{"psgix.io"};
         print $fh join(
             "\r\n",
-            "HTTP/1.1 100 Continue",
+            "HTTP/1.1 103 Early Hints",
             "link: </index.js>; rel=preload",
             "",
-            "HTTP/1.1 100 Continue",
+            "HTTP/1.1 103 Early Hints",
             "link: </index.js>; rel=preload",
             "",
             "",
@@ -305,6 +305,10 @@ builder {
             "HTTP/1.1 $status OK",
             ($query->get('link') ? (
                 "link: </index.js>; rel=preload",
+            ) : ()),
+            ($query->get('hop-by-hop') ? (
+                "connection: keep-alive",
+                "keep-alive: timeout=5",
             ) : ()),
             "",
             "HTTP/1.1 $status OK",

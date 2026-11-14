@@ -1,89 +1,44 @@
 #!perl
-# DTRACE_TEST=1 to skip to check prereqisites except for OS
 # H2OLOG_DEBUG=1 for more runtime logs
 use strict;
 use warnings FATAL => "all";
-use Net::EmptyPort qw(empty_port);
+use File::Temp qw(tempdir);
 use Test::More;
 use JSON;
 use Time::HiRes qw(sleep);
 use t::Util;
 
-run_as_root();
-
-my $h2olog_prog = bindir() . "/h2olog";
+my $h2olog_prog = "misc/h2olog";
 my $client_prog = bindir() . "/h2o-httpclient";
 
-unless ($ENV{DTRACE_TEST})  {
-  plan skip_all => "$h2olog_prog not found"
-      unless -e $h2olog_prog;
+plan skip_all => "$client_prog not found"
+    unless -e $client_prog;
 
-  plan skip_all => "$client_prog not found"
-      unless -e $client_prog;
+my $tempdir = tempdir(CLEANUP => 1);
+my $h2olog_socket = "$tempdir/h2olog.sock";
 
-  plan skip_all => 'dtrace support is off'
-      unless server_features()->{dtrace};
-}
-
-# make sure the h2o_return map does not exist at first,
-# but don't unlink it elsewhere to make sure `h2o_return` stuff works if the map already exists.
-unlink("/sys/fs/bpf/h2o_return");
-
-sub spawn_my_h2o {
-  my($quic_port) = @_;
-  return spawn_h2o({
-    opts => [qw(--mode=worker)],
-    user => getpwuid($ENV{SUDO_UID}),
-    conf => << "EOT",
-usdt-selective-tracing: ON
-listen:
-  type: quic
-  port: $quic_port
-  ssl:
-    key-file: examples/h2o/server.key
-    certificate-file: examples/h2o/server.crt
+my $server = spawn_h2o({
+  opts => [qw(--mode=worker)],
+  conf => << "EOT",
+# an attempt to reduce flakiness (at least that caused by there being many worker threads)
+num-threads: 1
 hosts:
   default:
     paths:
       /:
         file.dir: t/assets/doc_root
+  h2olog:
+    h2olog: appdata
+    listen:
+      - type: unix
+        port: $h2olog_socket
+    paths: {}
 EOT
 });
-}
-
-subtest "h2olog should be able to start when h2o has no `usdt-selective-tracing: ON`", sub {
-  my $server = spawn_h2o(<<'EOT');
-hosts:
-  default:
-    paths:
-      /:
-        file.dir: t/assets/doc_root
-EOT
-
-  my $tracer = H2ologTracer->new({
-    pid => $server->{pid},
-    args => [],
-  });
-
-  my ($headers) = run_prog("$client_prog http://127.0.0.1:$server->{port}/");
-  like $headers, qr{^HTTP/1\.1 200\b}, "req: HTTP/1";
-
-  my $trace;
-  until (($trace = $tracer->get_trace()) =~ /\n/) {}
-  pass "h2olog has startded successfully";
-};
-
-
-my $quic_port = empty_port({
-    host  => "127.0.0.1",
-    proto => "udp",
-});
-
-my $server = spawn_my_h2o($quic_port);
 
 subtest "h2olog -S=1.00", sub {
   my $tracer = H2ologTracer->new({
-    pid => $server->{pid},
+    path => $h2olog_socket,
     args => ["-S", "1.0"],
   });
   subtest "TCP", sub {
@@ -96,10 +51,10 @@ subtest "h2olog -S=1.00", sub {
       diag "h2olog output:\n", $trace;
     }
     my @logs = map { decode_json($_) } split /\n/, $trace;
-    ok scalar(grep { $_->{type} eq "h1-accept" } @logs), "h1-accept has been logged";
+    ok scalar(grep { $_->{type} eq "h1_accept" } @logs), "h1-accept has been logged";
   };
   subtest "QUIC", sub {
-    my ($headers) = run_prog("$client_prog -3 https://127.0.0.1:$quic_port/");
+    my ($headers) = run_prog("$client_prog -k -3 100 https://127.0.0.1:$server->{quic_port}/");
     like $headers, qr{^HTTP/3 200\b}, "req: HTTP/3";
 
     my $trace;
@@ -108,13 +63,13 @@ subtest "h2olog -S=1.00", sub {
       diag "h2olog output:\n", $trace;
     }
     my @logs = map { decode_json($_) } split /\n/, $trace;
-    ok scalar(grep { $_->{type} eq "h3s-accept" } @logs), "h3s-accept has been logged";
+    ok scalar(grep { $_->{type} eq "h3s_accept" } @logs), "h3s-accept has been logged";
   };
 };
 
 subtest "h2olog -S=0.00", sub {
   my $tracer = H2ologTracer->new({
-    pid => $server->{pid},
+    path => $h2olog_socket,
     args => ["-S", "0.0"],
   });
 
@@ -129,11 +84,11 @@ subtest "h2olog -S=0.00", sub {
       diag "h2olog output:\n", $trace;
     }
 
-    is $trace, "", "nothing has been logged";
+    unlike $trace, qr{^(?!.+"type":"async-io-).+}m, "nothing logged other than async-io-";
   };
 
   subtest "QUIC", sub {
-    my ($headers) = run_prog("$client_prog -3 https://127.0.0.1:$quic_port/");
+    my ($headers) = run_prog("$client_prog -k -3 100 https://127.0.0.1:$server->{quic_port}/");
     like $headers, qr{^HTTP/3 200\n}, "req: HTTP/3";
 
     sleep(1);
@@ -161,12 +116,12 @@ subtest "h2olog -S=0.00", sub {
 
 subtest "h2olog -A=127.0.0.2", sub {
   my $tracer = H2ologTracer->new({
-    pid => $server->{pid},
+    path => $h2olog_socket,
     args => ["-A", "127.0.0.2"],
   });
 
   subtest "with non-matched IP address", sub {
-    my ($headers) = run_prog("$client_prog -3 https://127.0.0.1:$quic_port/");
+    my ($headers) = run_prog("$client_prog -k -3 100 https://127.0.0.1:$server->{quic_port}/");
     like $headers, qr{^HTTP/3 200\n}, "req: HTTP/3";
 
     sleep(1);
@@ -189,6 +144,9 @@ subtest "h2olog -A=127.0.0.2", sub {
         $_->{type} eq "h3s-destroy"
       } @logs
     ], [], "no h3s-destroy header in logs";
+
+    diag $trace
+        unless test_is_passing();
   };
 
   subtest "with matched IP address", sub {
@@ -205,23 +163,27 @@ subtest "h2olog -A=127.0.0.2", sub {
     my @logs = map { decode_json($_) } split /\n/, $trace;
 
     is_deeply scalar(grep {
-        $_->{type} eq "h1-accept"
+        $_->{type} eq "h1_accept"
       } @logs), 1, "h1-accept header in logs";
 
     is_deeply scalar(grep {
-        $_->{type} eq "h1-close"
+        $_->{type} eq "h1_close"
       } @logs), 1, "h1-close header in logs";
+
+    diag $trace
+        unless test_is_passing();
   };
+
 };
 
 subtest "h2olog -N=localhost.examp1e.net", sub {
   my $tracer = H2ologTracer->new({
-    pid => $server->{pid},
+    path => $h2olog_socket,
     args => ["-N", "localhost.examp1e.net"],
   });
 
   subtest "with non-matched domain name", sub {
-    my ($headers) = run_prog("$client_prog -3 https://127.0.0.1:$quic_port/");
+    my ($headers) = run_prog("$client_prog -k -3 100 https://127.0.0.1:$server->{quic_port}/");
     like $headers, qr{^HTTP/3 200\n}, "req: HTTP/3";
 
     sleep(1);
@@ -235,19 +197,19 @@ subtest "h2olog -N=localhost.examp1e.net", sub {
 
     is_deeply [
       grep {
-        $_->{type} eq "h3s-accept"
+        $_->{type} eq "h3s_accept"
       } @logs
     ], [], "no h3s-accept header in logs";
 
     is_deeply [
       grep {
-        $_->{type} eq "h3s-destroy"
+        $_->{type} eq "h3s_destroy"
       } @logs
     ], [], "no h3s-destroy header in logs";
   };
 
   subtest "with matched domain name", sub {
-    my ($headers) = run_prog("$client_prog -3 https://localhost.examp1e.net:$quic_port/");
+    my ($headers) = run_prog("$client_prog -k -3 100 https://localhost.examp1e.net:$server->{quic_port}/");
     like $headers, qr{^HTTP/3 200\n}, "req: HTTP/3";
 
     sleep(1);
@@ -260,25 +222,25 @@ subtest "h2olog -N=localhost.examp1e.net", sub {
     my @logs = map { decode_json($_) } split /\n/, $trace;
 
     is_deeply scalar(grep {
-        $_->{type} eq "h3s-accept"
+        $_->{type} eq "h3s_accept"
       } @logs), 1, "h3s-accept header in logs";
 
     is_deeply scalar(grep {
-        $_->{type} eq "h3s-destroy"
+        $_->{type} eq "h3s_destroy"
       } @logs), 1, "h3s-destroy header in logs";
   };
 };
 subtest "multiple h2olog with sampling filters", sub {
   my $tracer1 = H2ologTracer->new({
-    pid => $server->{pid},
+    path => $h2olog_socket,
     args => ["-S", "0.0"],
   });
   my $tracer2 = H2ologTracer->new({
-    pid => $server->{pid},
+    path => $h2olog_socket,
     args => ["-S", "0.0"],
   });
 
-  my ($headers) = run_prog("$client_prog -3 https://127.0.0.1:$quic_port/");
+  my ($headers) = run_prog("$client_prog -k -3 100 https://127.0.0.1:$server->{quic_port}/");
   like $headers, qr{^HTTP/3 200\n}, "req: HTTP/3";
 
   my($trace1, $trace2);
@@ -293,32 +255,7 @@ subtest "multiple h2olog with sampling filters", sub {
   pass "multiple tracers can attach to the same h2o process";
 };
 
-# wait until the server and the tracer exits
 diag "shutting down ...";
 undef $server;
-
-subtest "h2o_return exists", sub {
-  ok -f "/sys/fs/bpf/h2o_return", "h2o_return does exist";
-
-  my $server = spawn_my_h2o($quic_port);
-
-  my $tracer = H2ologTracer->new({
-    pid => $server->{pid},
-    args => ["-S", "0.0"],
-  });
-
-  my ($headers) = run_prog("$client_prog -3 100 https://127.0.0.1:$quic_port/");
-  like $headers, qr{^HTTP/3 200\b}, "req: HTTP/3";
-
-  my $trace;
-  until (($trace = $tracer->get_trace()) =~ /\n/) {}
-  my @logs = map { decode_json($_) } split /\n/, $trace;
-
-  is scalar(
-    grep {
-      $_->{type} eq "h3s-accept"
-    } @logs
-  ), 0, "no h3s-accept header in logs";
-};
 
 done_testing();

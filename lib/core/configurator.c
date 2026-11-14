@@ -23,6 +23,8 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <inttypes.h>
+#include <sys/types.h>
+#include <netinet/udp.h>
 #include "h2o.h"
 #include "h2o/configurator.h"
 
@@ -239,17 +241,6 @@ Exit:
     return ret;
 }
 
-static int sort_from_longer_paths(const yoml_mapping_element_t *x, const yoml_mapping_element_t *y)
-{
-    size_t xlen = strlen(x->key->data.scalar), ylen = strlen(y->key->data.scalar);
-    if (xlen < ylen)
-        return 1;
-    else if (xlen > ylen)
-        return -1;
-    /* apply strcmp for stable sort */
-    return strcmp(x->key->data.scalar, y->key->data.scalar);
-}
-
 static yoml_t *convert_path_config_node(h2o_configurator_command_t *cmd, yoml_t *node)
 {
     size_t i, j;
@@ -327,8 +318,6 @@ static int on_config_paths(h2o_configurator_command_t *cmd, h2o_configurator_con
             return -1;
         }
     }
-    qsort(node->data.mapping.elements, node->data.mapping.size, sizeof(node->data.mapping.elements[0]),
-          (int (*)(const void *, const void *))sort_from_longer_paths);
 
     for (i = 0; i != node->data.mapping.size; ++i) {
         yoml_t *key = node->data.mapping.elements[i].key, *value;
@@ -373,6 +362,13 @@ static int on_config_hosts(h2o_configurator_command_t *cmd, h2o_configurator_con
             h2o_configurator_errprintf(cmd, key, "wildcard (*) can only be used at the start of the hostname");
             return -1;
         }
+        for (size_t i = 0; i != hostname.len; ++i) {
+            /* reject invalid chars; ACME support in the standalone server relies on this sanitization */
+            if (hostname.base[i] <= ' ' || hostname.base[i] == '/') {
+                h2o_configurator_errprintf(cmd, key, "hostname cotains an invalid character");
+                return -1;
+            }
+        }
         h2o_configurator_context_t *host_ctx = create_context(ctx, 0);
         if ((host_ctx->hostconf = h2o_config_register_host(host_ctx->globalconf, hostname, port)) == NULL) {
             h2o_configurator_errprintf(cmd, key, "duplicate host entry");
@@ -414,9 +410,22 @@ static int on_config_max_delegations(h2o_configurator_command_t *cmd, h2o_config
     return h2o_configurator_scanf(cmd, node, "%u", &ctx->globalconf->max_delegations);
 }
 
+static int on_config_max_reprocesses(h2o_configurator_command_t *cmd, h2o_configurator_context_t *ctx, yoml_t *node)
+{
+    return h2o_configurator_scanf(cmd, node, "%u", &ctx->globalconf->max_reprocesses);
+}
+
 static int on_config_handshake_timeout(h2o_configurator_command_t *cmd, h2o_configurator_context_t *ctx, yoml_t *node)
 {
     return config_timeout(cmd, node, &ctx->globalconf->handshake_timeout);
+}
+
+static int on_config_max_spare_pipes(h2o_configurator_command_t *cmd, h2o_configurator_context_t *ctx, yoml_t *node)
+{
+    if (h2o_configurator_scanf(cmd, node, "%zu", &ctx->globalconf->max_spare_pipes) != 0)
+        return -1;
+
+    return 0;
 }
 
 static int on_config_http1_request_timeout(h2o_configurator_command_t *cmd, h2o_configurator_context_t *ctx, yoml_t *node)
@@ -446,6 +455,11 @@ static int on_config_http2_idle_timeout(h2o_configurator_command_t *cmd, h2o_con
 static int on_config_http2_graceful_shutdown_timeout(h2o_configurator_command_t *cmd, h2o_configurator_context_t *ctx, yoml_t *node)
 {
     return config_timeout(cmd, node, &ctx->globalconf->http2.graceful_shutdown_timeout);
+}
+
+static int on_config_http2_max_streams(h2o_configurator_command_t *cmd, h2o_configurator_context_t *ctx, yoml_t *node)
+{
+    return h2o_configurator_scanf(cmd, node, "%" SCNu32, &ctx->globalconf->http2.max_streams);
 }
 
 static int on_config_http2_max_concurrent_requests_per_connection(h2o_configurator_command_t *cmd, h2o_configurator_context_t *ctx,
@@ -581,6 +595,11 @@ static int on_config_http2_casper(h2o_configurator_command_t *cmd, h2o_configura
     return 0;
 }
 
+static int on_config_http2_dos_delay(h2o_configurator_command_t *cmd, h2o_configurator_context_t *ctx, yoml_t *node)
+{
+    return h2o_configurator_scanf(cmd, node, "%" SCNu64, &ctx->globalconf->http2.dos_delay);
+}
+
 static int on_config_http3_idle_timeout(h2o_configurator_command_t *cmd, h2o_configurator_context_t *ctx, yoml_t *node)
 {
     return config_timeout(cmd, node, &ctx->globalconf->http3.idle_timeout);
@@ -596,23 +615,59 @@ static int on_config_http3_input_window_size(h2o_configurator_command_t *cmd, h2
     uint32_t v;
     if (h2o_configurator_scanf(cmd, node, "%" SCNu32, &v) != 0)
         return -1;
-    if (v < H2O_HTTP3_INITIAL_REQUEST_STREAM_WINDOW_SIZE) {
-        h2o_configurator_errprintf(cmd, node, "window size must be no less than %u",
-                                   (unsigned)H2O_HTTP3_INITIAL_REQUEST_STREAM_WINDOW_SIZE);
+    if (v < h2o_http3_calc_min_flow_control_size(H2O_MAX_REQLEN)) {
+        h2o_configurator_errprintf(cmd, node, "window size must be no less than %" PRIu64,
+                                   h2o_http3_calc_min_flow_control_size(H2O_MAX_REQLEN));
         return -1;
     }
     ctx->globalconf->http3.active_stream_window_size = v;
     return 0;
 }
 
-static int on_config_http3_delayed_ack(h2o_configurator_command_t *cmd, h2o_configurator_context_t *ctx, yoml_t *node)
+static int on_config_http3_ack_frequency(h2o_configurator_command_t *cmd, h2o_configurator_context_t *ctx, yoml_t *node)
+{
+    double v;
+
+    if (h2o_configurator_scanf(cmd, node, "%lf", &v) != 0)
+        return -1;
+    if (!(0 <= v && v <= 1)) {
+        h2o_configurator_errprintf(cmd, node, "ack frequency must be between 0 and 1");
+        return -1;
+    }
+    ctx->globalconf->http3.ack_frequency = (uint16_t)(v * 1024);
+    return 0;
+}
+
+static int on_config_http3_allow_delayed_ack(h2o_configurator_command_t *cmd, h2o_configurator_context_t *ctx, yoml_t *node)
 {
     ssize_t on;
 
     if ((on = h2o_configurator_get_one_of(cmd, node, "OFF,ON")) == -1)
         return -1;
-    ctx->globalconf->http3.use_delayed_ack = (uint8_t)on;
+    ctx->globalconf->http3.allow_delayed_ack = (uint8_t)on;
     return 0;
+}
+
+static int on_config_http3_gso(h2o_configurator_command_t *cmd, h2o_configurator_context_t *ctx, yoml_t *node)
+{
+    ssize_t on;
+
+    if ((on = h2o_configurator_get_one_of(cmd, node, "OFF,ON")) == -1)
+        return -1;
+#if !defined(UDP_SEGMENT)
+    if (on) {
+        h2o_configurator_errprintf(cmd, node, "this build does not support UDP GSO");
+        return -1;
+    }
+#endif
+    ctx->globalconf->http3.use_gso = (uint8_t)on;
+    return 0;
+}
+
+static int on_config_http3_max_concurrent_streaming_requests_per_connection(h2o_configurator_command_t *cmd,
+                                                                            h2o_configurator_context_t *ctx, yoml_t *node)
+{
+    return h2o_configurator_scanf(cmd, node, "%zu", &ctx->globalconf->http3.max_concurrent_streaming_requests_per_connection);
 }
 
 static int assert_is_mimetype(h2o_configurator_command_t *cmd, yoml_t *node)
@@ -811,10 +866,18 @@ static int on_config_custom_handler(h2o_configurator_command_t *cmd, h2o_configu
         exts[1] = NULL;
         break;
     case YOML_TYPE_SEQUENCE: {
+        if (ext_node->data.sequence.size == 0) {
+            h2o_configurator_errprintf(cmd, ext_node, "`extensions` must not be empty");
+            return -1;
+        }
         exts = alloca((ext_node->data.sequence.size + 1) * sizeof(*exts));
         size_t i;
         for (i = 0; i != ext_node->data.sequence.size; ++i) {
             yoml_t *n = ext_node->data.sequence.elements[i];
+            if (n->type != YOML_TYPE_SCALAR) {
+                h2o_configurator_errprintf(cmd, n, "`extensions` must be a scalar or sequence of scalar");
+                return -1;
+            }
             if ((exts[i] = normalize_ext(cmd, n)) == NULL)
                 return -1;
         }
@@ -964,15 +1027,6 @@ static int on_config_stash(h2o_configurator_command_t *cmd, h2o_configurator_con
     return 0;
 }
 
-static int on_config_usdt_selective_tracing(h2o_configurator_command_t *cmd, h2o_configurator_context_t *ctx, yoml_t *node)
-{
-    ssize_t on;
-    if ((on = h2o_configurator_get_one_of(cmd, node, "OFF,ON")) == -1)
-        return -1;
-    ctx->globalconf->usdt_selective_tracing = (int)on;
-    return 0;
-}
-
 void h2o_configurator__init_core(h2o_globalconf_t *conf)
 {
     /* check if already initialized */
@@ -1005,9 +1059,18 @@ void h2o_configurator__init_core(h2o_globalconf_t *conf)
         h2o_configurator_define_command(&c->super, "max-delegations",
                                         H2O_CONFIGURATOR_FLAG_GLOBAL | H2O_CONFIGURATOR_FLAG_EXPECT_SCALAR,
                                         on_config_max_delegations);
+        h2o_configurator_define_command(&c->super, "max-reprocesses",
+                                        H2O_CONFIGURATOR_FLAG_GLOBAL | H2O_CONFIGURATOR_FLAG_EXPECT_SCALAR,
+                                        on_config_max_reprocesses);
         h2o_configurator_define_command(&c->super, "handshake-timeout",
                                         H2O_CONFIGURATOR_FLAG_GLOBAL | H2O_CONFIGURATOR_FLAG_EXPECT_SCALAR,
                                         on_config_handshake_timeout);
+        h2o_configurator_define_command(&c->super, "max-spare-pipes",
+                                        H2O_CONFIGURATOR_FLAG_GLOBAL | H2O_CONFIGURATOR_FLAG_EXPECT_SCALAR,
+                                        on_config_max_spare_pipes);
+        h2o_configurator_define_command(&c->super, "proxy.max-spare-pipes" /* for compatibility, retain old name as an alias */,
+                                        H2O_CONFIGURATOR_FLAG_GLOBAL | H2O_CONFIGURATOR_FLAG_EXPECT_SCALAR,
+                                        on_config_max_spare_pipes);
         h2o_configurator_define_command(&c->super, "http1-request-timeout",
                                         H2O_CONFIGURATOR_FLAG_GLOBAL | H2O_CONFIGURATOR_FLAG_EXPECT_SCALAR,
                                         on_config_http1_request_timeout);
@@ -1023,6 +1086,9 @@ void h2o_configurator__init_core(h2o_globalconf_t *conf)
         h2o_configurator_define_command(&c->super, "http2-graceful-shutdown-timeout",
                                         H2O_CONFIGURATOR_FLAG_GLOBAL | H2O_CONFIGURATOR_FLAG_EXPECT_SCALAR,
                                         on_config_http2_graceful_shutdown_timeout);
+        h2o_configurator_define_command(&c->super, "http2-max-streams",
+                                        H2O_CONFIGURATOR_FLAG_GLOBAL | H2O_CONFIGURATOR_FLAG_EXPECT_SCALAR,
+                                        on_config_http2_max_streams);
         h2o_configurator_define_command(&c->super, "http2-max-concurrent-requests-per-connection",
                                         H2O_CONFIGURATOR_FLAG_GLOBAL | H2O_CONFIGURATOR_FLAG_EXPECT_SCALAR,
                                         on_config_http2_max_concurrent_requests_per_connection);
@@ -1055,6 +1121,9 @@ void h2o_configurator__init_core(h2o_globalconf_t *conf)
                                         on_config_http2_allow_cross_origin_push);
         h2o_configurator_define_command(&c->super, "http2-casper", H2O_CONFIGURATOR_FLAG_GLOBAL | H2O_CONFIGURATOR_FLAG_HOST,
                                         on_config_http2_casper);
+        h2o_configurator_define_command(&c->super, "http2-dos-delay",
+                                        H2O_CONFIGURATOR_FLAG_GLOBAL | H2O_CONFIGURATOR_FLAG_EXPECT_SCALAR,
+                                        on_config_http2_dos_delay);
         h2o_configurator_define_command(&c->super, "http3-idle-timeout",
                                         H2O_CONFIGURATOR_FLAG_GLOBAL | H2O_CONFIGURATOR_FLAG_EXPECT_SCALAR,
                                         on_config_http3_idle_timeout);
@@ -1064,9 +1133,17 @@ void h2o_configurator__init_core(h2o_globalconf_t *conf)
         h2o_configurator_define_command(&c->super, "http3-input-window-size",
                                         H2O_CONFIGURATOR_FLAG_GLOBAL | H2O_CONFIGURATOR_FLAG_EXPECT_SCALAR,
                                         on_config_http3_input_window_size);
-        h2o_configurator_define_command(&c->super, "http3-delayed-ack",
+        h2o_configurator_define_command(&c->super, "http3-ack-frequency",
                                         H2O_CONFIGURATOR_FLAG_GLOBAL | H2O_CONFIGURATOR_FLAG_EXPECT_SCALAR,
-                                        on_config_http3_delayed_ack);
+                                        on_config_http3_ack_frequency);
+        h2o_configurator_define_command(&c->super, "http3-allow-delayed-ack",
+                                        H2O_CONFIGURATOR_FLAG_GLOBAL | H2O_CONFIGURATOR_FLAG_EXPECT_SCALAR,
+                                        on_config_http3_allow_delayed_ack);
+        h2o_configurator_define_command(&c->super, "http3-gso", H2O_CONFIGURATOR_FLAG_GLOBAL | H2O_CONFIGURATOR_FLAG_EXPECT_SCALAR,
+                                        on_config_http3_gso);
+        h2o_configurator_define_command(&c->super, "http3-max-concurrent-streaming-requests-per-connection",
+                                        H2O_CONFIGURATOR_FLAG_GLOBAL | H2O_CONFIGURATOR_FLAG_EXPECT_SCALAR,
+                                        on_config_http3_max_concurrent_streaming_requests_per_connection);
         h2o_configurator_define_command(&c->super, "file.mime.settypes",
                                         (H2O_CONFIGURATOR_FLAG_ALL_LEVELS & ~H2O_CONFIGURATOR_FLAG_EXTENSION) |
                                             H2O_CONFIGURATOR_FLAG_EXPECT_MAPPING,
@@ -1103,9 +1180,6 @@ void h2o_configurator__init_core(h2o_globalconf_t *conf)
                                         H2O_CONFIGURATOR_FLAG_GLOBAL | H2O_CONFIGURATOR_FLAG_EXPECT_SCALAR,
                                         on_config_send_informational);
         h2o_configurator_define_command(&c->super, "stash", H2O_CONFIGURATOR_FLAG_ALL_LEVELS, on_config_stash);
-        h2o_configurator_define_command(&c->super, "usdt-selective-tracing",
-                                        H2O_CONFIGURATOR_FLAG_GLOBAL | H2O_CONFIGURATOR_FLAG_EXPECT_SCALAR,
-                                        on_config_usdt_selective_tracing);
     }
 }
 
@@ -1114,8 +1188,6 @@ void h2o_configurator__dispose_configurators(h2o_globalconf_t *conf)
     while (!h2o_linklist_is_empty(&conf->configurators)) {
         h2o_configurator_t *c = H2O_STRUCT_FROM_MEMBER(h2o_configurator_t, _link, conf->configurators.next);
         h2o_linklist_unlink(&c->_link);
-        if (c->dispose != NULL)
-            c->dispose(c);
         destroy_configurator(c);
     }
 }

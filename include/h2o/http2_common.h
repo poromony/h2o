@@ -26,7 +26,6 @@
 #include "h2o/header.h"
 #include "h2o/url.h"
 #include "h2o/memory.h"
-#include "h2o/cache_digests.h"
 
 #define H2O_HTTP2_SETTINGS_HEADER_TABLE_SIZE 1
 #define H2O_HTTP2_SETTINGS_ENABLE_PUSH 2
@@ -34,6 +33,7 @@
 #define H2O_HTTP2_SETTINGS_INITIAL_WINDOW_SIZE 4
 #define H2O_HTTP2_SETTINGS_MAX_FRAME_SIZE 5
 #define H2O_HTTP2_SETTINGS_MAX_HEADER_LIST_SIZE 6
+#define H2O_HTTP2_SETTINGS_ENABLE_CONNECT_PROTOCOL 8
 
 /* defined as negated form of the error codes defined in HTTP2-spec section 7 */
 #define H2O_HTTP2_ERROR_NONE 0
@@ -101,18 +101,20 @@ typedef struct st_h2o_hpack_header_table_entry_t {
 void h2o_hpack_dispose_header_table(h2o_hpack_header_table_t *header_table);
 
 size_t h2o_hpack_encode_string(uint8_t *dst, const char *s, size_t len);
-void h2o_hpack_flatten_push_promise(h2o_buffer_t **buf, h2o_hpack_header_table_t *header_table, uint32_t stream_id,
-                                    size_t max_frame_size, const h2o_url_scheme_t *scheme, h2o_iovec_t authority,
-                                    h2o_iovec_t method, h2o_iovec_t path, const h2o_header_t *headers, size_t num_headers,
-                                    uint32_t parent_stream_id);
-void h2o_hpack_flatten_response(h2o_buffer_t **buf, h2o_hpack_header_table_t *header_table, uint32_t stream_id,
-                                size_t max_frame_size, int status, const h2o_header_t *headers, size_t num_headers,
-                                const h2o_iovec_t *server_name, size_t content_length);
-void h2o_hpack_flatten_request(h2o_buffer_t **buf, h2o_hpack_header_table_t *header_table, uint32_t stream_id,
-                               size_t max_frame_size, h2o_iovec_t method, h2o_url_t *url, const h2o_header_t *headers,
-                               size_t num_headers, int is_end_stream);
-void h2o_hpack_flatten_trailers(h2o_buffer_t **buf, h2o_hpack_header_table_t *header_table, uint32_t stream_id,
-                                size_t max_frame_size, const h2o_header_t *headers, size_t num_headers);
+void h2o_hpack_flatten_push_promise(h2o_buffer_t **buf, h2o_hpack_header_table_t *header_table, uint32_t hpack_capacity,
+                                    uint32_t stream_id, size_t max_frame_size, const h2o_url_scheme_t *scheme,
+                                    h2o_iovec_t authority, h2o_iovec_t method, h2o_iovec_t path, const h2o_header_t *headers,
+                                    size_t num_headers, uint32_t parent_stream_id);
+size_t h2o_hpack_flatten_response(h2o_buffer_t **buf, h2o_hpack_header_table_t *header_table, uint32_t hpack_capacity,
+                                  uint32_t stream_id, size_t max_frame_size, int status, const h2o_header_t *headers,
+                                  size_t num_headers, const h2o_iovec_t *server_name, size_t content_length, int is_end_stream);
+void h2o_hpack_flatten_request(h2o_buffer_t **buf, h2o_hpack_header_table_t *header_table, uint32_t hpack_capacity,
+                               uint32_t stream_id, size_t max_frame_size, h2o_iovec_t method, h2o_url_t *url, h2o_iovec_t protocol,
+                               const h2o_header_t *headers, size_t num_headers, int is_end_stream, int send_own_expect);
+void h2o_hpack_flatten_trailers(h2o_buffer_t **buf, h2o_hpack_header_table_t *header_table, uint32_t hpack_capacity,
+                                uint32_t stream_id, size_t max_frame_size, const h2o_header_t *headers, size_t num_headers);
+
+extern h2o_buffer_prototype_t h2o_http2_wbuf_buffer_prototype;
 
 /* frames */
 
@@ -173,14 +175,20 @@ typedef struct st_h2o_http2_window_update_payload_t {
     uint32_t window_size_increment;
 } h2o_http2_window_update_payload_t;
 
+typedef struct st_h2o_http2_settings_kvpair {
+    uint16_t key;
+    uint32_t value;
+} h2o_http2_settings_kvpair_t;
+
 uint8_t *h2o_http2_encode_frame_header(uint8_t *dst, size_t length, uint8_t type, uint8_t flags, int32_t stream_id);
 
 #define h2o_http2_encode_rst_stream_frame(buf, stream_id, errnum)                                                                  \
-    h2o_http2__encode_rst_stream_frame(buf, stream_id, (H2O_BUILD_ASSERT((errnum) > 0), errnum))
+    h2o_http2__encode_rst_stream_frame(buf, stream_id, (H2O_BUILD_ASSERT((errnum) >= 0), errnum))
 
 void h2o_http2__encode_rst_stream_frame(h2o_buffer_t **buf, uint32_t stream_id, int errnum);
 void h2o_http2_encode_ping_frame(h2o_buffer_t **buf, int is_ack, const uint8_t *data);
 void h2o_http2_encode_goaway_frame(h2o_buffer_t **buf, uint32_t last_stream_id, int errnum, h2o_iovec_t additional_data);
+void h2o_http2_encode_settings_frame(h2o_buffer_t **buf, h2o_http2_settings_kvpair_t *settings, size_t num_settings);
 void h2o_http2_encode_window_update_frame(h2o_buffer_t **buf, uint32_t stream_id, int32_t window_size_increment);
 void h2o_http2_encode_origin_frame(h2o_buffer_t **buf, h2o_iovec_t payload);
 ssize_t h2o_http2_decode_frame(h2o_http2_frame_t *frame, const uint8_t *src, size_t len, size_t max_frame_size,
@@ -211,6 +219,7 @@ static h2o_hpack_header_table_entry_t *h2o_hpack_header_table_get(h2o_hpack_head
 static uint16_t h2o_http2_decode16u(const uint8_t *src);
 static uint32_t h2o_http2_decode24u(const uint8_t *src);
 static uint32_t h2o_http2_decode32u(const uint8_t *src);
+static uint8_t *h2o_http2_encode16u(uint8_t *dst, uint16_t value);
 static uint8_t *h2o_http2_encode24u(uint8_t *dst, uint32_t value);
 static uint8_t *h2o_http2_encode32u(uint8_t *dst, uint32_t value);
 
@@ -253,6 +262,13 @@ inline uint32_t h2o_http2_decode24u(const uint8_t *src)
 inline uint32_t h2o_http2_decode32u(const uint8_t *src)
 {
     return (uint32_t)src[0] << 24 | (uint32_t)src[1] << 16 | (uint32_t)src[2] << 8 | src[3];
+}
+
+inline uint8_t *h2o_http2_encode16u(uint8_t *dst, uint16_t value)
+{
+    *dst++ = value >> 8;
+    *dst++ = value;
+    return dst;
 }
 
 inline uint8_t *h2o_http2_encode24u(uint8_t *dst, uint32_t value)

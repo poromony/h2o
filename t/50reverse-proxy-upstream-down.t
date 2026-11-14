@@ -1,6 +1,6 @@
 use strict;
 use warnings;
-use Net::EmptyPort qw(check_port empty_port);
+use Net::EmptyPort qw(check_port);
 use Test::More;
 use t::Util;
 
@@ -30,6 +30,35 @@ subtest 'non-persistent' => sub {
 
 subtest 'persistent' => sub {
     doit(1);
+};
+
+# The request body is not read any further once the connection to upstream fails. Otherwise, the HTTP/2 stream would continue to
+# occupy the slot for streaming requests, blocking the next one sent on the same connection.
+subtest 'streaming request body' => sub {
+    my $upstream_port = empty_port();
+    my $server = spawn_h2o(<< "EOT");
+hosts:
+  default:
+    paths:
+      /:
+        proxy.reverse.url: http://127.0.0.1:$upstream_port
+EOT
+    my $output = run_with_h2get_simple($server, <<"EOR");
+        [1, 3].each { |stream_id|
+            req = { ":method" => "POST", ":authority" => host, ":scheme" => "https", ":path" => "/" }
+            h2g.send_headers(req, stream_id, END_HEADERS)
+            h2g.send_data(stream_id, 0, "a" * 1000)
+        }
+        while true
+            f = h2g.read(2000)
+            break if f == nil
+            puts "stream:#{f.stream_id}" if f.type == "HEADERS"
+            puts f.to_s
+        end
+EOR
+    for my $stream_id (1, 3) {
+        like $output, qr{^stream:$stream_id\n.*?':status' => '502'}ms, "stream $stream_id";
+    }
 };
 
 done_testing();

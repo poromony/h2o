@@ -98,12 +98,10 @@ struct st_h2o_http2_stream_t {
     } input_window;
     h2o_http2_priority_t received_priority;
     H2O_VECTOR(h2o_sendvec_t) _data;
-    size_t _data_off; /* offset within _data.entries[0] */
     /**
      * points to http2_conn_t::num_streams::* in which the stream is counted
      */
     h2o_http2_conn_num_streams_t *_num_streams_slot;
-    h2o_cache_digests_t *cache_digests;
     union {
         struct {
             uint32_t parent_stream_id;
@@ -113,19 +111,43 @@ struct st_h2o_http2_stream_t {
             unsigned casper_is_ready : 1;
         } pull;
     };
+    /**
+     * see h2o_http2_conn_t::num_streams.blocked_by_server
+     */
     unsigned blocked_by_server : 1;
     /**
-     * if the response body is streaming
+     * if the stream was reset by peer sending an RST_STREAM
      */
-    unsigned _req_streaming_in_progress : 1;
+    unsigned reset_by_peer : 1;
     /**
-     *  steate of the ostream, only used in push mode
+     * if the stream was reset by peer's invalid action
+     */
+    unsigned reset_by_peer_action : 1;
+    /**
+     * indicates if RST_STREAM(NO_ERROR) should be sent to the client after sending a complete response
+     */
+    unsigned delayed_rst_stream_no_error : 1;
+    /**
+     *  state of the ostream, only used in push mode
      */
     h2o_send_state_t send_state;
     /**
-     * request body buffer
+     * request body (not available when `buf` is NULL
      */
-    h2o_buffer_t *req_body;
+    struct {
+        h2o_buffer_t *buf;
+        enum en_h2o_req_body_state_t {
+            H2O_HTTP2_REQ_BODY_NONE,
+            H2O_HTTP2_REQ_BODY_OPEN_BEFORE_FIRST_FRAME,
+            H2O_HTTP2_REQ_BODY_OPEN,
+            H2O_HTTP2_REQ_BODY_CLOSE_QUEUED,
+            H2O_HTTP2_REQ_BODY_CLOSE_DELIVERED
+        } state;
+        /**
+         * if the response body is streaming or was streamed, including tunnels
+         */
+        unsigned streamed : 1;
+    } req_body;
     /**
      * the request object; placed at last since it is large and has it's own ctor
      */
@@ -158,19 +180,30 @@ struct st_h2o_http2_conn_t {
         h2o_http2_conn_num_streams_t priority;
         h2o_http2_conn_num_streams_t pull;
         h2o_http2_conn_num_streams_t push;
+        /**
+         * number of streams current blocked due to the internal concurrency limit
+         */
         uint32_t blocked_by_server;
+        /**
+         * number of streams that have the flag with the same name being set
+         */
         uint32_t _req_streaming_in_progress;
+        /**
+         * number of CONNECT tunnels inflight (this is a proper subset of `_req_streaming_in_progress`)
+         */
+        uint32_t tunnel;
     } num_streams;
     /* internal */
     h2o_http2_scheduler_node_t scheduler;
     h2o_http2_conn_state_t state;
-    int is_chromium_dependency_tree; /* indicates whether the client-generated dependency tree is from Chromium
-                                      * Dependency tree from Chromium satisfies the following properties:
-                                      * 1) Every stream has the exclusive bit set
-                                      * 2) On a dependency tree, child's weight is lower than or equal to parent's
-                                      */
+    unsigned is_chromium_dependency_tree : 1; /* indicates whether the client-generated dependency tree is from Chromium. The
+                                               * denpendency tree of Chromium satisfies the following properties:
+                                               * 1) Every stream has the exclusive bit set
+                                               * 2) On a dependency tree, child's weight is lower than or equal to parent's
+                                               */
+    unsigned received_any_request : 1; /* if any request has been received. The connection is not subject to culling until at least
+                                        * one request has been processed. */
 
-    h2o_linklist_t _conns; /* linklist to h2o_context_t::http2._conns */
     ssize_t (*_read_expect)(h2o_http2_conn_t *conn, const uint8_t *src, size_t len, const char **err_desc);
     h2o_buffer_t *_http1_req_input; /* contains data referred to by original request via HTTP/1.1 */
     h2o_hpack_header_table_t _input_header_table;
@@ -178,7 +211,13 @@ struct st_h2o_http2_conn_t {
     h2o_hpack_header_table_t _output_header_table;
     h2o_linklist_t _pending_reqs; /* list of h2o_http2_stream_t that contain pending requests */
     h2o_timer_t _timeout_entry;
-    h2o_buffer_t *_headers_unparsed; /* for temporary storing HEADERS|CONTINUATION frames without END_HEADERS flag set */
+    /**
+     * for temporary storing HEADERS|CONTINUATION frames without END_HEADERS flag set
+     */
+    struct {
+        h2o_buffer_t *buf;
+        uint32_t stream_id; /* stream id of the HEADERS frame */
+    } _continuation;
     struct {
         h2o_buffer_t *buf;
         h2o_buffer_t *buf_in_flight;
@@ -205,6 +244,17 @@ struct st_h2o_http2_conn_t {
         struct timeval settings_sent_at;
         struct timeval settings_acked_at;
     } timestamps;
+    /**
+     * timeout entry used for graceful shutdown
+     */
+    h2o_timer_t _graceful_shutdown_timeout;
+    /**
+     * DoS mitigation; the idea here is to delay processing requests when observing suspicious behavior
+     */
+    struct {
+        h2o_timer_t process_delay;
+        size_t reset_budget; /* RST_STREAM frames are considered suspicious when this value goes down to zero */
+    } dos_mitigation;
 };
 
 /* connection */
@@ -357,11 +407,26 @@ inline void h2o_http2_stream_set_state(h2o_http2_conn_t *conn, h2o_http2_stream_
         }
         stream->state = new_state;
         stream->req.timestamps.response_end_at = h2o_gettimeofday(conn->super.ctx->loop);
+        if (h2o_timeval_is_null(&stream->req.timestamps.response_start_at)) {
+            stream->req.timestamps.response_start_at = stream->req.timestamps.response_end_at;
+        }
         --stream->_num_streams_slot->open;
         stream->_num_streams_slot = NULL;
         if (stream->blocked_by_server)
             h2o_http2_stream_set_blocked_by_server(conn, stream, 0);
         break;
+    }
+
+    /* Unless the connection is already in shutdown state, set the connection to ether IDLE or ACTIVE state depending on if there is
+     * any request in flight. */
+    if (!h2o_timer_is_linked(&conn->_graceful_shutdown_timeout)) {
+        size_t num_reqs_inflight = conn->num_streams.pull.open + conn->num_streams.pull.half_closed + conn->num_streams.push.open +
+                                   conn->num_streams.push.half_closed;
+        if (conn->received_any_request && num_reqs_inflight == 0) {
+            h2o_conn_set_state(&conn->super, H2O_CONN_STATE_IDLE);
+        } else {
+            h2o_conn_set_state(&conn->super, H2O_CONN_STATE_ACTIVE);
+        }
     }
 }
 
@@ -392,10 +457,10 @@ inline int h2o_http2_stream_has_pending_data(h2o_http2_stream_t *stream)
 inline void h2o_http2_stream_send_push_promise(h2o_http2_conn_t *conn, h2o_http2_stream_t *stream)
 {
     assert(!stream->push.promise_sent);
-    h2o_hpack_flatten_push_promise(&conn->_write.buf, &conn->_output_header_table, stream->stream_id,
-                                   conn->peer_settings.max_frame_size, stream->req.input.scheme, stream->req.input.authority,
-                                   stream->req.input.method, stream->req.input.path, stream->req.headers.entries,
-                                   stream->req.headers.size, stream->push.parent_stream_id);
+    h2o_hpack_flatten_push_promise(&conn->_write.buf, &conn->_output_header_table, conn->peer_settings.header_table_size,
+                                   stream->stream_id, conn->peer_settings.max_frame_size, stream->req.input.scheme,
+                                   stream->req.input.authority, stream->req.input.method, stream->req.input.path,
+                                   stream->req.headers.entries, stream->req.headers.size, stream->push.parent_stream_id);
     stream->push.promise_sent = 1;
 }
 

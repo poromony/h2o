@@ -27,15 +27,22 @@
 #include <limits.h>
 #include <stdio.h>
 #include <stdlib.h>
+#if defined(__linux__)
+#include <sys/sendfile.h>
+#endif
 #include <sys/stat.h>
 #include <sys/types.h>
 #include <time.h>
 #include <unistd.h>
-
 #include "h2o.h"
+#include "h2o/pipe_sender.h"
+#if H2O_USE_IO_URING
+#include "h2o/io_uring.h"
+#endif
 
 #define MAX_BUF_SIZE 65000
 #define BOUNDARY_SIZE 20
+#define MAX_RANGES 200
 #define FIXED_PART_SIZE (sizeof("\r\n--") - 1 + BOUNDARY_SIZE + sizeof("\r\nContent-Range: bytes=-/\r\nContent-Type: \r\n\r\n") - 1)
 
 struct st_h2o_sendfile_generator_t {
@@ -44,7 +51,6 @@ struct st_h2o_sendfile_generator_t {
         h2o_filecache_ref_t *ref;
         off_t off;
     } file;
-    h2o_req_t *req;
     size_t bytesleft;
     h2o_iovec_t content_encoding;
     unsigned send_vary : 1;
@@ -63,6 +69,13 @@ struct st_h2o_sendfile_generator_t {
         char last_modified[H2O_TIMESTR_RFC1123_LEN + 1];
         char etag[H2O_FILECACHE_ETAG_MAXLEN + 1];
     } header_bufs;
+#if H2O_USE_IO_URING
+    /**
+     * back pointer to the request which is necessary for splicing async; becomes NULL when the generator is stopped
+     */
+    h2o_req_t *src_req;
+    h2o_pipe_sender_t pipe_sender;
+#endif
 };
 
 struct st_h2o_file_handler_t {
@@ -116,6 +129,9 @@ static void close_file(struct st_h2o_sendfile_generator_t *self)
         h2o_filecache_close_file(self->file.ref);
         self->file.ref = NULL;
     }
+#if H2O_USE_IO_URING
+    h2o_pipe_sender_dispose(&self->pipe_sender, self->src_req != NULL ? self->src_req->conn->ctx : NULL);
+#endif
 }
 
 static void on_generator_dispose(void *_self)
@@ -124,63 +140,134 @@ static void on_generator_dispose(void *_self)
     close_file(self);
 }
 
-static int do_pread(h2o_sendvec_t *src, h2o_req_t *req, h2o_iovec_t dst, size_t off)
+#if H2O_USE_IO_URING
+
+static void do_stop_async_splice(h2o_generator_t *_self, h2o_req_t *req)
+{
+    struct st_h2o_sendfile_generator_t *self = (void *)_self;
+    self->src_req = NULL;
+}
+
+static void do_proceed_on_splice_complete(h2o_io_uring_cmd_t *cmd)
+{
+    struct st_h2o_sendfile_generator_t *self = cmd->cb.data;
+
+    if (self->src_req == NULL) {
+        h2o_mem_release_shared(self);
+        return;
+    }
+
+    h2o_mem_release_shared(self);
+
+    if (cmd->result <= 0) {
+        assert(cmd->result != -EINTR); /* could this ever happen? */
+        h2o_send(self->src_req, NULL, 0, H2O_SEND_STATE_ERROR);
+        return;
+    }
+
+    self->file.off += cmd->result;
+    self->bytesleft -= cmd->result;
+
+    h2o_send_state_t send_state = self->bytesleft != 0 ? H2O_SEND_STATE_IN_PROGRESS : H2O_SEND_STATE_FINAL;
+
+    h2o_pipe_sender_send(self->src_req, &self->pipe_sender, cmd->result, send_state);
+}
+
+#endif
+
+static int do_pread(h2o_sendvec_t *src, void *dst, size_t len)
 {
     struct st_h2o_sendfile_generator_t *self = (void *)src->cb_arg[0];
-    uint64_t file_chunk_at = src->cb_arg[1];
+    uint64_t *file_chunk_at = &src->cb_arg[1];
     size_t bytes_read = 0;
     ssize_t rret;
 
-    assert(off + dst.len <= src->len);
-
     /* read */
-    while (bytes_read < dst.len) {
-        while ((rret = pread(self->file.ref->fd, dst.base + bytes_read, dst.len - bytes_read, file_chunk_at + off + bytes_read)) ==
-                   -1 &&
-               errno == EINTR)
+    while (bytes_read < len) {
+        while ((rret = pread(self->file.ref->fd, dst + bytes_read, len - bytes_read, *file_chunk_at)) == -1 && errno == EINTR)
             ;
-        if (rret == -1)
+        if (rret <= 0)
             return 0;
         bytes_read += rret;
+        *file_chunk_at += rret;
+        src->len -= rret;
     }
 
     return 1;
 }
 
-static void sendvec_update_refcnt(h2o_sendvec_t *vec, h2o_req_t *req, int is_incr)
+#if defined(__linux__)
+static size_t do_sendfile(int sockfd, int filefd, off_t off, size_t len)
 {
-    struct st_h2o_sendfile_generator_t *self = (void *)vec->cb_arg[0];
-
-    if (is_incr) {
-        h2o_mem_addref_shared(self);
-    } else {
-        h2o_mem_release_shared(self);
-    }
+    off_t iooff = off;
+    ssize_t ret;
+    while ((ret = sendfile(sockfd, filefd, &iooff, len)) == -1 && errno == EINTR)
+        ;
+    if (ret <= 0)
+        return ret == -1 && errno == EAGAIN ? 0 : SIZE_MAX;
+    return ret;
 }
+#elif defined(__APPLE__)
+static size_t do_sendfile(int sockfd, int filefd, off_t off, size_t len)
+{
+    off_t iolen = len;
+    int ret;
+    while ((ret = sendfile(filefd, sockfd, off, &iolen, NULL, 0)) != 0 && errno == EINTR)
+        ;
+    if (ret != 0 && errno != EAGAIN)
+        return SIZE_MAX;
+    return iolen;
+}
+#elif defined(__FreeBSD__)
+static size_t do_sendfile(int sockfd, int filefd, off_t off, size_t len)
+{
+    off_t outlen;
+    int ret;
+    while ((ret = sendfile(filefd, sockfd, off, len, NULL, &outlen, 0)) != 0 && errno == EINTR)
+        ;
+    if (ret != 0 && errno != EAGAIN)
+        return SIZE_MAX;
+    return outlen;
+}
+#else
+#define sendvec_sendfile NULL
+#endif
+#if !defined(sendvec_sendfile)
+static size_t sendvec_sendfile(h2o_sendvec_t *src, int sockfd, size_t len)
+{
+    struct st_h2o_sendfile_generator_t *self = (void *)src->cb_arg[0];
+    ssize_t bytes_sent = do_sendfile(sockfd, self->file.ref->fd, (off_t)src->cb_arg[1], len);
+    if (bytes_sent > 0) {
+        src->cb_arg[1] += bytes_sent;
+        src->len -= bytes_sent;
+    }
+    return bytes_sent;
+}
+#endif
 
 static void do_proceed(h2o_generator_t *_self, h2o_req_t *req)
 {
-    static const h2o_sendvec_callbacks_t sendvec_callbacks = {do_pread, sendvec_update_refcnt};
-
     struct st_h2o_sendfile_generator_t *self = (void *)_self;
-    h2o_sendvec_t vec;
-    h2o_send_state_t send_state;
+    size_t bytes_to_send = self->bytesleft < H2O_PULL_SENDVEC_MAX_SIZE ? self->bytesleft : H2O_PULL_SENDVEC_MAX_SIZE;
 
-    vec.len = self->bytesleft < H2O_PULL_SENDVEC_MAX_SIZE ? self->bytesleft : H2O_PULL_SENDVEC_MAX_SIZE;
-    vec.callbacks = &sendvec_callbacks;
-    vec.cb_arg[0] = (uint64_t)self;
-    vec.cb_arg[1] = self->file.off;
+    /* if io_uring is to be used, addref so that the self would not be released, then call `h2o_io_uring_splice_file` */
+#if H2O_USE_IO_URING
+    if (h2o_pipe_sender_in_use(&self->pipe_sender)) {
+        h2o_mem_addref_shared(self);
+        h2o_io_uring_splice(self->src_req->conn->ctx->loop, self->file.ref->fd, self->file.off, self->pipe_sender.fds[1], -1,
+                            bytes_to_send, 0, do_proceed_on_splice_complete, self);
+        return;
+    }
+#endif
+
+    static const h2o_sendvec_callbacks_t sendvec_callbacks = {.read_ = do_pread, .send_ = sendvec_sendfile};
+    h2o_sendvec_t vec = {
+        .callbacks = &sendvec_callbacks, .len = bytes_to_send, .cb_arg[0] = (uint64_t)self, .cb_arg[1] = self->file.off};
 
     self->file.off += vec.len;
     self->bytesleft -= vec.len;
-    if (self->bytesleft == 0) {
-        send_state = H2O_SEND_STATE_FINAL;
-    } else {
-        send_state = H2O_SEND_STATE_IN_PROGRESS;
-    }
 
-    /* send (closed in do_pread) */
-    h2o_sendvec(req, &vec, 1, send_state);
+    h2o_sendvec(req, &vec, 1, self->bytesleft != 0 ? H2O_SEND_STATE_IN_PROGRESS : H2O_SEND_STATE_FINAL);
 }
 
 static void do_multirange_proceed(h2o_generator_t *_self, h2o_req_t *req)
@@ -248,7 +335,8 @@ static struct st_h2o_sendfile_generator_t *create_generator(h2o_req_t *req, cons
     if ((flags & H2O_FILE_FLAG_SEND_COMPRESSED) != 0 && req->version >= 0x101) {
         int compressible_types = h2o_get_compressible_types(&req->headers);
         if (compressible_types != 0) {
-            char *variant_path = h2o_mem_alloc_pool(&req->pool, *variant_path, path_len + sizeof(".gz"));
+            /* the buffer has to accommodate the longest of the variant extensions tried below (`.zstd`) */
+            char *variant_path = h2o_mem_alloc_pool(&req->pool, *variant_path, path_len + sizeof(".zstd"));
             memcpy(variant_path, path, path_len);
 #define TRY_VARIANT(mask, enc, ext)                                                                                                \
     if ((compressible_types & mask) != 0) {                                                                                        \
@@ -259,7 +347,11 @@ static struct st_h2o_sendfile_generator_t *create_generator(h2o_req_t *req, cons
         }                                                                                                                          \
     }
             TRY_VARIANT(H2O_COMPRESSIBLE_BROTLI, "br", ".br");
+            TRY_VARIANT(H2O_COMPRESSIBLE_ZSTD, "zstd", ".zst");
             TRY_VARIANT(H2O_COMPRESSIBLE_GZIP, "gzip", ".gz");
+
+            // Deprecated
+            TRY_VARIANT(H2O_COMPRESSIBLE_ZSTD, "zstd", ".zstd");
 #undef TRY_VARIANT
         }
     }
@@ -289,7 +381,6 @@ Opened:
     self->super.stop = NULL;
     self->file.ref = fileref;
     self->file.off = 0;
-    self->req = NULL;
     self->bytesleft = self->file.ref->st.st_size;
     self->ranged.range_count = 0;
     self->ranged.range_infos = NULL;
@@ -297,6 +388,16 @@ Opened:
     self->send_vary = (flags & H2O_FILE_FLAG_SEND_COMPRESSED) != 0;
     self->send_etag = (flags & H2O_FILE_FLAG_NO_ETAG) == 0;
     self->gunzip = gunzip;
+#if H2O_USE_IO_URING
+    self->src_req = req;
+    h2o_pipe_sender_init(&self->pipe_sender);
+    int try_async_splice = (flags & H2O_FILE_FLAG_IO_URING) != 0 && self->bytesleft != 0;
+    if (try_async_splice && h2o_pipe_sender_start(req->conn->ctx, &self->pipe_sender)) {
+        self->super.stop = do_stop_async_splice;
+    } else if (try_async_splice) {
+        h2o_req_log_error(req, "lib/handler/file.c", "failed to allocate a pipe for async I/O; falling back to blocking I/O");
+    }
+#endif
 
     return self;
 }
@@ -326,16 +427,15 @@ static void send_decompressed(h2o_ostream_t *_self, h2o_req_t *req, h2o_sendvec_
     h2o_sendvec_t *outbufs;
     size_t outbufcnt;
 
-    state = h2o_compress_transform(self->decompressor, req, inbufs, inbufcnt, state, &outbufs, &outbufcnt);
-    h2o_ostream_send_next(&self->super, req, outbufs, outbufcnt, state);
+    h2o_send_state_t transformed = h2o_compress_transform(self->decompressor, req, inbufs, inbufcnt, state, &outbufs, &outbufcnt);
+    if (transformed == H2O_SEND_STATE_ERROR && state != H2O_SEND_STATE_ERROR)
+        h2o_req_log_error(req, "lib/handler/file.c", "failed to decompress the file");
+    h2o_ostream_send_next(&self->super, req, outbufs, outbufcnt, transformed);
 }
 
 static void do_send_file(struct st_h2o_sendfile_generator_t *self, h2o_req_t *req, int status, const char *reason,
                          h2o_iovec_t mime_type, h2o_mime_attributes_t *mime_attr, int is_get)
 {
-    /* link the request */
-    self->req = req;
-
     /* setup response */
     req->res.status = status;
     req->res.reason = reason;
@@ -457,7 +557,7 @@ static size_t *process_range(h2o_mem_pool_t *pool, h2o_iovec_t *range_value, siz
     if (range == SIZE_MAX)                                                                                                         \
         return NULL;
 
-    size_t range_start = SIZE_MAX, range_count = 0;
+    size_t range_start = SIZE_MAX, range_size = 0, total_size = 0;
     char *buf = range_value->base, *buf_end = buf + range_value->len;
     int needs_comma = 0;
     H2O_VECTOR(size_t) ranges = {NULL};
@@ -478,6 +578,8 @@ static size_t *process_range(h2o_mem_pool_t *pool, h2o_iovec_t *range_value, siz
             }
             needs_comma = 0;
             buf++;
+            if (buf == buf_end)
+                break;
             while (H2O_UNLIKELY(*buf == ' ') || H2O_UNLIKELY(*buf == '\t')) {
                 buf++;
                 CHECK_EOF();
@@ -489,28 +591,28 @@ static size_t *process_range(h2o_mem_pool_t *pool, h2o_iovec_t *range_value, siz
             CHECK_EOF();
             if (*buf++ != '-')
                 return NULL;
-            range_count = h2o_strtosizefwd(&buf, buf_end - buf);
+            range_size = h2o_strtosizefwd(&buf, buf_end - buf);
             if (H2O_UNLIKELY(range_start >= file_size)) {
                 range_start = SIZE_MAX;
-            } else if (H2O_LIKELY(range_count != SIZE_MAX)) {
-                if (H2O_UNLIKELY(range_count > file_size - 1))
-                    range_count = file_size - 1;
-                if (H2O_LIKELY(range_start <= range_count))
-                    range_count -= range_start - 1;
+            } else if (H2O_LIKELY(range_size != SIZE_MAX)) {
+                if (H2O_UNLIKELY(range_size > file_size - 1))
+                    range_size = file_size - 1;
+                if (H2O_LIKELY(range_start <= range_size))
+                    range_size -= range_start - 1;
                 else
                     range_start = SIZE_MAX;
             } else {
-                range_count = file_size - range_start;
+                range_size = file_size - range_start;
             }
         } else if (H2O_LIKELY(*buf++ == '-')) {
             CHECK_EOF();
-            range_count = h2o_strtosizefwd(&buf, buf_end - buf);
-            if (H2O_UNLIKELY(range_count == SIZE_MAX))
+            range_size = h2o_strtosizefwd(&buf, buf_end - buf);
+            if (H2O_UNLIKELY(range_size == SIZE_MAX))
                 return NULL;
-            if (H2O_LIKELY(range_count != 0)) {
-                if (H2O_UNLIKELY(range_count > file_size))
-                    range_count = file_size;
-                range_start = file_size - range_count;
+            if (H2O_LIKELY(range_size != 0)) {
+                if (H2O_UNLIKELY(range_size > file_size))
+                    range_size = file_size;
+                range_start = file_size - range_size;
             } else {
                 range_start = SIZE_MAX;
             }
@@ -519,9 +621,21 @@ static size_t *process_range(h2o_mem_pool_t *pool, h2o_iovec_t *range_value, siz
         }
 
         if (H2O_LIKELY(range_start != SIZE_MAX)) {
+            /* If there are too many ranges, or if the ranges add up to more than the size of the file (which can only happen when
+             * they overlap), return one range covering the entire file. Otherwise, a short header like `bytes=0-,0-,0-,...` would
+             * yield as many copies of the file, and one like `bytes=0-0,2-2,4-4,...` would yield as many parts each carrying the
+             * multipart framing. */
+            if (ranges.size / 2 == MAX_RANGES || range_size > file_size - total_size) {
+                assert(ranges.size != 0); /* a single range never exceeds the limits */
+                ranges.entries[0] = 0;
+                ranges.entries[1] = file_size;
+                *ret = 1;
+                return ranges.entries;
+            }
+            total_size += range_size;
             h2o_vector_reserve(pool, &ranges, ranges.size + 2);
             ranges.entries[ranges.size++] = range_start;
-            ranges.entries[ranges.size++] = range_count;
+            ranges.entries[ranges.size++] = range_size;
         }
         if (buf != buf_end)
             while (H2O_UNLIKELY(*buf == ' ') || H2O_UNLIKELY(*buf == '\t')) {
@@ -554,19 +668,25 @@ static int delegate_dynamic_request(h2o_req_t *req, h2o_iovec_t script_name, h2o
                                     size_t local_path_len, h2o_mimemap_type_t *mime_type)
 {
     h2o_filereq_t *filereq;
-    h2o_handler_t *handler;
 
     assert(mime_type->data.dynamic.pathconf.handlers.size == 1);
+    assert(mime_type->data.dynamic.pathconf._filters.size == 0);
+    assert(mime_type->data.dynamic.pathconf._loggers.size == 0);
 
+    /* setup CGI attributes (e.g., PATH_INFO) */
     filereq = h2o_mem_alloc_pool(&req->pool, *filereq, 1);
     filereq->script_name = script_name;
     filereq->path_info = path_info;
     filereq->local_path = h2o_strdup(&req->pool, local_path, local_path_len);
-
-    h2o_req_bind_conf(req, req->hostconf, &mime_type->data.dynamic.pathconf);
     req->filereq = filereq;
 
-    handler = mime_type->data.dynamic.pathconf.handlers.entries[0];
+    /* apply environment */
+    if (mime_type->data.dynamic.pathconf.env != NULL)
+        h2o_req_apply_env(req, mime_type->data.dynamic.pathconf.env);
+
+    /* call the dynamic handler while retaining current hostconf or pathconf; in other words, filters and loggers of current
+     * path level is applied, rather than of the extension level */
+    h2o_handler_t *handler = mime_type->data.dynamic.pathconf.handlers.entries[0];
     return handler->on_req(handler, req);
 }
 
@@ -692,6 +812,10 @@ static int serve_with_generator(struct st_h2o_sendfile_generator_t *generator, h
             h2o_send_error_416(req, "Request Range Not Satisfiable", "requested range not satisfiable",
                                H2O_SEND_ERROR_KEEP_HEADERS);
             goto Close;
+        } else if (range_count == 1 && range_infos[1] == generator->bytesleft) {
+            /* send the entire file as 200 rather than as 206 with one range covering the entire file (RFC 9110 section 14.2) */
+            assert(range_infos[0] == 0);
+            goto EntireFile;
         }
         generator->ranged.range_count = range_count;
         generator->ranged.range_infos = range_infos;
@@ -765,6 +889,10 @@ static int on_req(h2o_handler_t *_self, h2o_req_t *req)
     struct st_h2o_sendfile_generator_t *generator = NULL;
     int is_dir;
 
+    /* path including a NULL character never matches a file system (because NULL cannot be used on the file system) */
+    if (req->path_normalized_has_null_char)
+        return -1;
+
     if (req->path_normalized.len < self->conf_path.len) {
         h2o_iovec_t dest = h2o_uri_escape(&req->pool, self->conf_path.base, self->conf_path.len, "/");
         if (req->query_at != SIZE_MAX)
@@ -775,7 +903,8 @@ static int on_req(h2o_handler_t *_self, h2o_req_t *req)
 
     /* build path (still unterminated at the end of the block) */
     req_path_prefix = self->conf_path.len;
-    rpath = alloca(self->real_path.len + (req->path_normalized.len - req_path_prefix) + self->max_index_file_len + 1);
+    rpath = h2o_mem_alloc_pool(&req->pool, char,
+                               self->real_path.len + (req->path_normalized.len - req_path_prefix) + self->max_index_file_len + 1);
     rpath_len = 0;
     memcpy(rpath + rpath_len, self->real_path.base, self->real_path.len);
     rpath_len += self->real_path.len;

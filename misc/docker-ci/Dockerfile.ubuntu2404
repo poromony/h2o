@@ -1,0 +1,138 @@
+FROM ubuntu:24.04
+
+ENV DEBIAN_FRONTEND=noninteractive
+
+RUN apt-get --yes update
+RUN apt-get install --yes \
+	apache2-utils \
+	autoconf \
+	bison \
+	bpftrace \
+	brotli \
+	bzip2 \
+	clang \
+	cmake \
+	cmake-data \
+	dnsutils \
+	flex \
+	git \
+	iproute2 \
+	libbpfcc-dev \
+	libbrotli-dev \
+	libc-ares-dev \
+	libcap-dev \
+	libclang-dev \
+	libfaketime \
+	libedit-dev \
+	libelf-dev \
+	libev-dev \
+	libpsl-dev \
+	libssl-dev \
+	libtool \
+	liburing-dev \
+	libuv1-dev \
+	llvm \
+	memcached \
+	net-tools \
+	netcat-openbsd \
+	nodejs \
+	php-cgi \
+	pkgconf \
+	python3 \
+	redis-server \
+	rsync \
+	ruby-dev \
+	sudo \
+	systemtap-sdt-dev \
+	time \
+	wget \
+	zlib1g-dev \
+	zstd
+
+# perl
+RUN apt-get install --yes \
+	cpanminus \
+	libbsd-resource-perl \
+	libfcgi-perl \
+	libfcgi-procmanager-perl \
+	libipc-signal-perl \
+	libjson-perl \
+	liblist-moreutils-perl \
+	libplack-perl \
+	libscope-guard-perl \
+	libtest-exception-perl \
+	libwww-perl \
+	libio-socket-ssl-perl
+ENV PERL_CPANM_OPT="--mirror https://cpan.metacpan.org/"
+RUN cpanm -n Test::More Starlet Protocol::HTTP2 Test::TCP
+RUN cpanm -n NLNETLABS/Net-DNS-1.36.tar.gz # Net-DNS 1.39 has issues around use of alarm, fork, etc.
+
+# openssl 3.5
+RUN mkdir -p /opt/src \
+	&& cd /opt/src \
+	&& wget --quiet -O - https://github.com/openssl/openssl/releases/download/openssl-3.5.1/openssl-3.5.1.tar.gz | tar xzf - \
+	&& cd /opt/src/openssl-3.5.1 \
+	&& ./config --prefix=/usr/local/openssl-3.5 no-shared \
+	&& make install clean
+
+# HTTP/3 stack: nghttp3, ngtcp2, nghttp2 (h2load), curl
+RUN mkdir -p /opt/src \
+	&& cd /opt/src \
+	&& wget --quiet -O - https://github.com/ngtcp2/nghttp3/releases/download/v1.18.0/nghttp3-1.18.0.tar.bz2 | tar xjf - \
+	&& cd nghttp3-1.18.0 \
+	&& ./configure --enable-lib-only --disable-shared \
+	&& make install clean
+RUN mkdir -p /opt/src \
+	&& cd /opt/src \
+	&& wget --quiet -O - https://github.com/ngtcp2/ngtcp2/releases/download/v1.25.0/ngtcp2-1.25.0.tar.bz2 | tar xjf - \
+	&& cd ngtcp2-1.25.0 \
+	&& PKG_CONFIG_PATH=/usr/local/openssl-3.5/lib64/pkgconfig ./configure --enable-lib-only --disable-shared \
+	&& make install clean
+RUN mkdir -p /opt/src \
+	&& cd /opt/src \
+	&& wget --quiet -O - https://github.com/nghttp2/nghttp2/releases/download/v1.69.0/nghttp2-1.69.0.tar.bz2 | tar xjf - \
+	&& cd nghttp2-1.69.0 \
+	&& PKG_CONFIG_PATH=/usr/local/openssl-3.5/lib64/pkgconfig:/usr/local/lib/pkgconfig ./configure --disable-shared --enable-app --enable-http3 \
+	&& make install clean
+RUN mkdir -p /opt/src \
+	&& cd /opt/src \
+	&& wget --quiet -O - https://curl.se/download/curl-8.22.0.tar.bz2 | tar xjf - \
+	&& cd curl-8.22.0 \
+	&& USE_CURL_SSLKEYLOGFILE=true ./configure --disable-shared --with-nghttp2 --with-ngtcp2 --with-nghttp3 --with-openssl=/usr/local/openssl-3.5 \
+	&& make install clean
+
+# boringssl
+RUN apt-get install --yes golang-go
+RUN mkdir -p /opt/src && cd /opt/src && git clone --depth=1 https://github.com/google/boringssl.git \
+ && (cd boringssl && mkdir build && cd build \
+      && cmake .. -DCMAKE_INSTALL_PREFIX=/opt/boringssl && make install && cp libdecrepit.a /opt/boringssl/lib/ \
+      && make clean \
+    )
+
+# libaegis
+RUN mkdir -p /opt/src && cd /opt/src && git clone --depth=1 https://github.com/jedisct1/libaegis.git \
+ && (cd libaegis && mkdir build && cd build && cmake .. -DCMAKE_INSTALL_PREFIX=/usr/local && make install && make clean)
+
+# h2spec
+RUN curl -Ls https://github.com/summerwind/h2spec/releases/download/v2.6.0/h2spec_linux_amd64.tar.gz | tar zx -C /usr/local/bin
+
+# mbedtls
+RUN mkdir -p /opt/src && cd /opt/src && wget -O - https://github.com/Mbed-TLS/mbedtls/archive/refs/tags/v3.5.1.tar.gz | tar xzf - \
+  && cd mbedtls-3.5.1 && mkdir -p build && cd build \
+  && cmake .. -DCMAKE_INSTALL_PREFIX=/usr/local && make install \
+  && make clean
+
+# use dumb-init
+RUN wget -O /usr/local/bin/dumb-init https://github.com/Yelp/dumb-init/releases/download/v1.2.1/dumb-init_1.2.1_amd64 \
+ && chmod +x /usr/local/bin/dumb-init
+
+# komake
+RUN wget -O /usr/local/bin/komake https://raw.githubusercontent.com/kazuho/komake/main/komake && chmod +x /usr/local/bin/komake
+
+# create user
+RUN useradd --create-home ci
+RUN echo 'ci ALL=(ALL) NOPASSWD:ALL' >> /etc/sudoers
+WORKDIR /home/ci
+USER ci
+
+ENTRYPOINT ["/usr/local/bin/dumb-init", "--rewrite", "1:0"]

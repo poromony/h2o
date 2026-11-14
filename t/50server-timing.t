@@ -1,6 +1,6 @@
 use strict;
 use warnings;
-use Net::EmptyPort qw(check_port empty_port);
+use Net::EmptyPort qw(check_port);
 use Test::More;
 use Time::HiRes;
 use t::Util;
@@ -23,6 +23,16 @@ hosts:
                   yield 'hello'
                   sleep 1
                   yield 'world!'
+                end
+              end.new]
+            }
+      /zero:
+        - server-timing: on
+        - mruby.handler: |
+            proc {|env|
+              [200, {}, Class.new do
+                def each
+                  sleep 1
                 end
               end.new]
             }
@@ -55,6 +65,13 @@ EOT
         ok defined($sts->[0]->{connect});
         ok defined($sts->[1]->{total});
         $check->(@$sts);
+    };
+
+    subtest 'http2 cl:0' => sub {
+        my ($sts) = nghttp_get($server, '/zero');
+        is scalar(@$sts), 2, 'header and trailer';
+        ok defined($sts->[0]->{connect});
+        ok defined($sts->[1]->{total});
     };
 };
 

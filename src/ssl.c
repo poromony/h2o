@@ -24,6 +24,10 @@
 #include <limits.h>
 #include <pthread.h>
 #include <sys/stat.h>
+#ifndef H2O_NO_OPENSSL_SUPPRESS_DEPRECATED
+#define OPENSSL_SUPPRESS_DEPRECATED /* we'd like to use HMAC_Init_ex while it exists, to minimize code divergence between          \
+                                     * different TLS stacks. */
+#endif
 #include <openssl/crypto.h>
 #include <openssl/err.h>
 #include <openssl/evp.h>
@@ -34,6 +38,9 @@
 #include "yrmcds.h"
 #include "picotls.h"
 #include "picotls/openssl.h"
+#if H2O_USE_FUSION
+#include "picotls/fusion.h"
+#endif
 #include "quicly.h"
 #include "quicly/defaults.h"
 #include "h2o/file.h"
@@ -115,8 +122,9 @@ static void spawn_cache_cleanup_thread(SSL_CTX **_contexts, size_t num_contexts)
     pthread_t tid;
     pthread_attr_t attr;
     pthread_attr_init(&attr);
-    pthread_attr_setdetachstate(&attr, 1);
+    pthread_attr_setdetachstate(&attr, PTHREAD_CREATE_DETACHED);
     h2o_multithread_create_thread(&tid, &attr, cache_cleanup_thread, contexts);
+    pthread_attr_destroy(&attr);
 }
 
 static void setup_cache_disable(SSL_CTX **contexts, size_t num_contexts)
@@ -131,7 +139,6 @@ static void setup_cache_enable(SSL_CTX **contexts, size_t num_contexts, int asyn
     size_t i;
     for (i = 0; i != num_contexts; ++i) {
         SSL_CTX_set_session_cache_mode(contexts[i], SSL_SESS_CACHE_SERVER | SSL_SESS_CACHE_NO_AUTO_CLEAR);
-        SSL_CTX_set_session_id_context(contexts[i], H2O_SESSID_CTX, H2O_SESSID_CTX_LEN);
         SSL_CTX_set_timeout(contexts[i], conf.lifetime);
         if (async_resumption)
             h2o_socket_ssl_async_resumption_setup_ctx(contexts[i]);
@@ -320,20 +327,29 @@ static int ticket_key_callback_ossl(SSL *ssl, unsigned char *key_name, unsigned 
     return ticket_key_callback(key_name, iv, ctx, hctx, enc);
 }
 
-static void calculate_quic_tp_tag(uint8_t *tag64, const quicly_context_t *ctx)
+static void calculate_quic_tag(uint8_t *tag64, const quicly_context_t *ctx, const h2o_http3_qpack_context_t *qpack)
 {
     ptls_buffer_t buf;
     uint8_t full_digest[PTLS_SHA256_DIGEST_SIZE];
+    int ret = 0;
 
-    /* calculate sha256 hash of remembered tp */
+    /* calculate sha256 hash of remembered transport parameters and HTTP/3 settings that constrain 0-RTT */
     ptls_buffer_init(&buf, "", 0);
-    if (quicly_build_session_ticket_auth_data(&buf, ctx) != 0 ||
-        ptls_calc_hash(&ptls_openssl_sha256, full_digest, buf.base, buf.off) != 0)
-        h2o_fatal("failed to calculate sha256 of remembered TPs");
+    if ((ret = quicly_build_session_ticket_auth_data(&buf, ctx)) != 0)
+        goto Exit;
+    ptls_buffer_push_quicint(&buf, H2O_HTTP3_SETTINGS_QPACK_MAX_TABLE_CAPACITY);
+    ptls_buffer_push_quicint(&buf, qpack->decoder_table_capacity);
+    if ((ret = ptls_calc_hash(&ptls_openssl_sha256, full_digest, buf.base, buf.off)) != 0)
+        goto Exit;
     ptls_buffer_dispose(&buf);
 
     /* use the first 64-bit */
     memcpy(tag64, full_digest, 8);
+    return;
+
+Exit: /* The if-error-goto-exit pattern is used because ptls_buffer_push_quicint relies on it. */
+    assert(ret != 0);
+    h2o_fatal("failed to build session ticket auth data");
 }
 
 struct encrypt_ticket_ptls_t {
@@ -373,13 +389,13 @@ static int encrypt_ticket_ptls(ptls_encrypt_ticket_t *_self, ptls_t *tls, int is
     }
 }
 
-static ptls_encrypt_ticket_t *create_encrypt_ticket_ptls(const quicly_context_t *quic)
+static ptls_encrypt_ticket_t *create_encrypt_ticket_ptls(const quicly_context_t *quic, const h2o_http3_qpack_context_t *qpack)
 {
-    struct encrypt_ticket_ptls_t *self = malloc(sizeof(*self));
+    struct encrypt_ticket_ptls_t *self = h2o_mem_alloc(sizeof(*self));
     *self = (struct encrypt_ticket_ptls_t){{encrypt_ticket_ptls}};
     if (quic != NULL) {
         self->is_quic = 1;
-        calculate_quic_tp_tag(self->quic_tag, quic);
+        calculate_quic_tag(self->quic_tag, quic, qpack);
     }
     return &self->super;
 }
@@ -499,7 +515,7 @@ static int serialize_ticket_entry(char *buf, size_t bufsz, struct st_session_tic
                     "  key: %s\n"
                     "  not_before: %" PRIu64 "\n"
                     "  not_after: %" PRIu64 "\n",
-                    name_buf, OBJ_nid2sn(EVP_CIPHER_type(ticket->cipher)), OBJ_nid2sn(EVP_MD_type(ticket->hmac)), key_buf,
+                    name_buf, OBJ_nid2sn(EVP_CIPHER_nid(ticket->cipher)), OBJ_nid2sn(EVP_MD_type(ticket->hmac)), key_buf,
                     ticket->not_before, ticket->not_after);
 }
 
@@ -758,13 +774,13 @@ static int ticket_redis_update_tickets(redisContext *ctx, h2o_iovec_t key, time_
         fprintf(stderr, "[lib/ssl.c] %s:redisCommand GET failed:%s\n", __func__, ctx->errstr);
         goto Exit;
     }
-    if (reply->type == REDIS_REPLY_STRING) {
-        int r = parse_tickets(&tickets, reply->str, reply->len, errbuf);
-        freeReplyObject(reply);
-        if (r != 0) {
-            fprintf(stderr, "[lib/ssl.c] %s:failed to parse response:%s\n", __func__, errbuf);
-            goto Exit;
-        }
+    int r = 0;
+    if (reply->type == REDIS_REPLY_STRING)
+        r = parse_tickets(&tickets, reply->str, reply->len, errbuf);
+    freeReplyObject(reply);
+    if (r != 0) {
+        fprintf(stderr, "[lib/ssl.c] %s:failed to parse response:%s\n", __func__, errbuf);
+        goto Exit;
     }
     if (tickets.size > 1)
         qsort(tickets.entries, tickets.size, sizeof(tickets.entries[0]), ticket_sort_compare);
@@ -1108,8 +1124,9 @@ void ssl_setup_session_resumption(SSL_CTX **contexts, size_t num_contexts, struc
         pthread_t tid;
         pthread_attr_t attr;
         pthread_attr_init(&attr);
-        pthread_attr_setdetachstate(&attr, 1);
+        pthread_attr_setdetachstate(&attr, PTHREAD_CREATE_DETACHED);
         h2o_multithread_create_thread(&tid, &attr, conf.ticket.update_thread, NULL);
+        pthread_attr_destroy(&attr);
         size_t i;
         for (i = 0; i != num_contexts; ++i) {
             SSL_CTX *ctx = contexts[i];
@@ -1124,12 +1141,12 @@ void ssl_setup_session_resumption(SSL_CTX **contexts, size_t num_contexts, struc
 #endif
 }
 
-void ssl_setup_session_resumption_ptls(ptls_context_t *ptls, quicly_context_t *quic)
+void ssl_setup_session_resumption_ptls(ptls_context_t *ptls, quicly_context_t *quic, const h2o_http3_qpack_context_t *qpack)
 {
     if (conf.ticket.update_thread != NULL) {
-        ptls->ticket_lifetime = 86400 * 7; // FIXME conf.lifetime
+        ptls->ticket_lifetime = conf.lifetime;
         assert((quic != NULL) == ptls->omit_end_of_early_data && "detected contradictory setting");
-        ptls->encrypt_ticket = create_encrypt_ticket_ptls(quic);
+        ptls->encrypt_ticket = create_encrypt_ticket_ptls(quic, qpack);
     }
 }
 
@@ -1175,6 +1192,9 @@ void init_openssl(void)
     SSL_load_error_strings();
     SSL_library_init();
     OpenSSL_add_all_algorithms();
+#if H2O_CAN_OSSL_ASYNC
+    ERR_load_ASYNC_strings();
+#endif
 
     cache_init_defaults();
 #if H2O_USE_SESSION_TICKETS
@@ -1199,7 +1219,7 @@ static __thread struct {
 
 static void init_quic_keyset(struct st_quic_keyset_t *keyset, uint8_t name, ptls_iovec_t master_secret)
 {
-    uint8_t master_digestbuf[PTLS_MAX_DIGEST_SIZE], keybuf[PTLS_MAX_SECRET_SIZE];
+    uint8_t master_digestbuf[PTLS_MAX_DIGEST_SIZE], keybuf[PTLS_MAX_DIGEST_SIZE];
     int ret;
 
     if (master_secret.len > PTLS_SHA256_DIGEST_SIZE) {
@@ -1207,11 +1227,21 @@ static void init_quic_keyset(struct st_quic_keyset_t *keyset, uint8_t name, ptls
         master_secret = ptls_iovec_init(master_digestbuf, PTLS_SHA256_DIGEST_SIZE);
     }
 
+    ptls_cipher_algorithm_t *cid_cipher;
+    if (quic_is_clustered) {
+        cid_cipher = &ptls_openssl_aes128ecb;
+    } else {
+        cid_cipher = &ptls_openssl_quiclb;
+#if H2O_USE_FUSION
+        if (ptls_fusion_is_supported_by_cpu())
+            cid_cipher = &ptls_fusion_quiclb;
+#endif
+    }
+
     keyset->name = name;
-    keyset->cid = quicly_new_default_cid_encryptor(quic_is_clustered ? &ptls_openssl_aes128ecb : &ptls_openssl_bfecb,
-                                                   &ptls_openssl_aes128ecb, &ptls_openssl_sha256, master_secret);
+    keyset->cid = quicly_new_default_cid_encryptor(cid_cipher, &ptls_openssl_aes128ecb, &ptls_openssl_sha256, master_secret);
     assert(keyset->cid != NULL);
-    ret = ptls_hkdf_expand_label(&ptls_openssl_sha256, keybuf, ptls_openssl_aes128gcm.key_size, master_secret, "address-token",
+    ret = ptls_hkdf_expand_label(&ptls_openssl_sha256, keybuf, PTLS_SHA256_DIGEST_SIZE, master_secret, "address-token",
                                  ptls_iovec_init(NULL, 0), "");
     assert(ret == 0);
     keyset->address_token.enc = ptls_aead_new(&ptls_openssl_aes128gcm, &ptls_openssl_sha256, 1, keybuf, "");
@@ -1322,7 +1352,7 @@ static int generate_stateless_reset_token(quicly_cid_encryptor_t *self, void *to
 
 quicly_cid_encryptor_t quic_cid_encryptor = {encrypt_cid, decrypt_cid, generate_stateless_reset_token};
 
-int quic_decrypt_address_token(quicly_address_token_plaintext_t *pt, ptls_iovec_t input, const char **err_desc)
+quicly_error_t quic_decrypt_address_token(quicly_address_token_plaintext_t *pt, ptls_iovec_t input, const char **err_desc)
 {
     struct st_quic_keyset_t *keyset;
 
@@ -1340,8 +1370,8 @@ ptls_aead_context_t *quic_get_address_token_encryptor(uint8_t *prefix)
     return keyset->address_token.enc;
 }
 
-static int generate_resumption_token(quicly_generate_resumption_token_t *self, quicly_conn_t *conn, ptls_buffer_t *buf,
-                                     quicly_address_token_plaintext_t *token)
+static quicly_error_t generate_resumption_token(quicly_generate_resumption_token_t *self, quicly_conn_t *conn, ptls_buffer_t *buf,
+                                                quicly_address_token_plaintext_t *token)
 {
     uint8_t prefix;
     ptls_aead_context_t *aead = quic_get_address_token_encryptor(&prefix);

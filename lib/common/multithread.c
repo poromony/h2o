@@ -237,7 +237,11 @@ h2o_loop_t *h2o_multithread_get_loop(h2o_multithread_queue_t *queue)
     if (queue == NULL)
         return NULL;
 #if H2O_USE_LIBUV
+#if UV_VERSION_MAJOR > 1 || (UV_VERSION_MAJOR == 1 && UV_VERSION_MINOR >= 19)
+    return uv_handle_get_loop((uv_handle_t *)&queue->async);
+#else
     return ((uv_handle_t *)&queue->async)->loop;
+#endif
 #else
     return h2o_socket_get_loop(queue->async.read);
 #endif
@@ -294,27 +298,20 @@ void h2o_barrier_init(h2o_barrier_t *barrier, size_t count)
     barrier->_out_of_wait = count;
 }
 
-int h2o_barrier_wait(h2o_barrier_t *barrier)
+void h2o_barrier_wait(h2o_barrier_t *barrier)
 {
-    int ret;
     pthread_mutex_lock(&barrier->_mutex);
     barrier->_count--;
     if (barrier->_count == 0) {
         pthread_cond_broadcast(&barrier->_cond);
-        ret = 1;
     } else {
-        while (barrier->_count)
+        while (barrier->_count != 0)
             pthread_cond_wait(&barrier->_cond, &barrier->_mutex);
-        ret = 0;
     }
     pthread_mutex_unlock(&barrier->_mutex);
-    /*
-     * this is needed to synchronize h2o_barrier_destroy with the
-     * exit of this function, so make sure that we can't destroy the
-     * mutex or the condition before all threads have exited wait()
-     */
+    /* This is needed to synchronize h2o_barrier_dispose with the exit of this function, so make sure that we can't destroy the
+     * mutex or the condition before all threads have exited wait(). */
     __sync_sub_and_fetch(&barrier->_out_of_wait, 1);
-    return ret;
 }
 
 int h2o_barrier_done(h2o_barrier_t *barrier)
@@ -327,7 +324,7 @@ void h2o_barrier_add(h2o_barrier_t *barrier, size_t delta)
     __sync_add_and_fetch(&barrier->_count, delta);
 }
 
-void h2o_barrier_destroy(h2o_barrier_t *barrier)
+void h2o_barrier_dispose(h2o_barrier_t *barrier)
 {
     while (__sync_add_and_fetch(&barrier->_out_of_wait, 0) != 0) {
         sched_yield();

@@ -41,6 +41,9 @@ module H2O
 
     class ACLHandler
 
+      class TooEarlyError < StandardError
+      end
+
       class ConditionalHandler
         def initialize(handler, cond)
           @handler = handler
@@ -63,9 +66,13 @@ module H2O
       end
 
       def call(env)
-        @acl.each {|ac|
-          return ac.call(env) if ac.satisfy?(env)
-        }
+        begin
+          @acl.each {|ac|
+            return ac.call(env) if ac.satisfy?(env)
+          }
+        rescue TooEarlyError => e
+          return [425, {}, []]
+        end
         return [399, {}, []]
       end
 
@@ -95,7 +102,8 @@ module H2O
           @env = env
         end
 
-        def addr(forwarded=true)
+        def addr(forwarded=false)
+          raise TooEarlyError if @env['HTTP_EARLY_DATA']
           addr = @env['REMOTE_ADDR']
           if forwarded && (xff = @env['HTTP_X_FORWARDED_FOR'])
             xaddr = xff.split(",")[0]

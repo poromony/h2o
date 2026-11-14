@@ -19,29 +19,19 @@
 # FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS
 # IN THE SOFTWARE.
 
-CMAKE_MINIMUM_REQUIRED(VERSION 2.8.11)
+CMAKE_MINIMUM_REQUIRED(VERSION 2.8.12...4.0)
 CMAKE_POLICY(SET CMP0003 NEW)
 
 PROJECT(h2o)
-
-SET(VERSION_MAJOR "2")
-SET(VERSION_MINOR "3")
-SET(VERSION_PATCH "0")
-SET(VERSION_PRERELEASE "-DEV")
-SET(VERSION "${VERSION_MAJOR}.${VERSION_MINOR}.${VERSION_PATCH}${VERSION_PRERELEASE}")
-SET(LIBRARY_VERSION_MAJOR "0")
-SET(LIBRARY_VERSION_MINOR "16")
-SET(LIBRARY_VERSION_PATCH "0")
-SET(LIBRARY_VERSION "${LIBRARY_VERSION_MAJOR}.${LIBRARY_VERSION_MINOR}.${LIBRARY_VERSION_PATCH}${VERSION_PRERELEASE}")
-SET(LIBRARY_SOVERSION "${LIBRARY_VERSION_MAJOR}.${LIBRARY_VERSION_MINOR}")
 
 INCLUDE(GNUInstallDirs)
 INCLUDE(CheckCSourceCompiles)
 INCLUDE(CMakePushCheckState)
 INCLUDE(ExternalProject)
+INCLUDE(deps/picotls/cmake/boringssl-adjust.cmake)
 INCLUDE(deps/picotls/cmake/dtrace-utils.cmake)
+INCLUDE(deps/picotls/cmake/fusion.cmake)
 
-CONFIGURE_FILE(${CMAKE_CURRENT_SOURCE_DIR}/version.h.in ${CMAKE_CURRENT_SOURCE_DIR}/include/h2o/version.h)
 CONFIGURE_FILE(${CMAKE_CURRENT_SOURCE_DIR}/libh2o.pc.in ${CMAKE_CURRENT_BINARY_DIR}/libh2o.pc @ONLY)
 CONFIGURE_FILE(${CMAKE_CURRENT_SOURCE_DIR}/libh2o-evloop.pc.in ${CMAKE_CURRENT_BINARY_DIR}/libh2o-evloop.pc @ONLY)
 
@@ -67,6 +57,7 @@ IF ((CMAKE_SYSTEM_NAME STREQUAL "Darwin") AND NOT (DEFINED OPENSSL_ROOT_DIR OR D
     ENDIF ()
 ENDIF ()
 FIND_PACKAGE(OpenSSL REQUIRED)
+BORINGSSL_ADJUST()
 FIND_PACKAGE(ZLIB REQUIRED)
 
 CHECK_C_SOURCE_COMPILES("
@@ -77,28 +68,7 @@ __sync_add_and_fetch(&a, 1);
 return 0;
 }" ARCH_SUPPORTS_64BIT_ATOMICS)
 
-CMAKE_PUSH_CHECK_STATE()
-SET(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -pthread")
-CHECK_C_SOURCE_COMPILES("
-#define _GNU_SOURCE
-#include <sched.h>
-#include <pthread.h>
-int main(void) {
-#ifndef __NetBSD__
-cpu_set_t s;
-CPU_ZERO(&s);
-pthread_setaffinity_np(0, sizeof(s), &s);
-#else
-cpuset_t *s = cpuset_create();
-cpuset_zero(s);
-pthread_setaffinity_np(0, cpuset_size(s), s);
-cpuset_destroy(s);
-#endif
-return 0;
-}" HAS_PTHREAD_SETAFFINITY_NP)
-CMAKE_POP_CHECK_STATE()
-
-# Find out if libc provices backtrace()
+# Find out if libc provides backtrace()
 CMAKE_PUSH_CHECK_STATE()
 FIND_LIBRARY(LIBC_BACKTRACE_LIB "execinfo")
 IF (LIBC_BACKTRACE_LIB)
@@ -164,10 +134,52 @@ IF (WITH_DTRACE)
     MESSAGE(STATUS "Enabling USDT support")
 ENDIF ()
 
+CHECK_FUSION_PREREQUISITES()
+OPTION(WITH_FUSION "build with fusion AES-GCM engine" ${WITH_FUSION_DEFAULT})
+
+# KTLS
+CHECK_C_SOURCE_COMPILES("
+#include <sys/socket.h>
+#include <linux/tcp.h>
+#include <linux/tls.h>
+int main (void) {
+    return TCP_ULP + SOL_TLS + TLS_TX + TLS_1_2_VERSION + TLS_CIPHER_AES_GCM_128 + TLS_CIPHER_AES_GCM_256;
+}
+" SYSTEM_HAS_KTLS)
+IF (SYSTEM_HAS_KTLS)
+    SET(WITH_KTLS_DEFAULT "ON")
+ELSE ()
+    SET(WITH_KTLS_DEFAULT "OFF")
+ENDIF ()
+OPTION(WITH_KTLS "use Kernel TLS" ${WITH_KTLS_DEFAULT})
+
+# aegis
+FIND_PACKAGE(aegis)
+IF (aegis_FOUND)
+  SET(WITH_AEGIS_DEFAULT "ON")
+ELSE ()
+  SET(WITH_AEGIS_DEFAULT "OFF")
+ENDIF ()
+OPTION(WITH_AEGIS "enable AEGIS (requires libaegis)" ${WITH_AEGIS_DEFAULT})
+
+IF (PKG_CONFIG_FOUND)
+    PKG_CHECK_MODULES(LIBURING liburing)
+ENDIF ()
+IF (LIBURING_FOUND)
+    SET(WITH_IO_URING_DEFAULT "ON")
+ELSE ()
+    SET(WITH_IO_URING_DEFAULT "OFF")
+ENDIF ()
+OPTION(WITH_IO_URING "whether or not to use io_uring" ${WITH_IO_URING_DEFAULT})
+
+OPTION(WITH_MPTCP "whether or not to support listening on MPTCP sockets" OFF)
+IF (WITH_MPTCP)
+    ADD_DEFINITIONS("-DH2O_WITH_MPTCP=1")
+ENDIF (WITH_MPTCP)
+
 INCLUDE_DIRECTORIES(
     include
     deps/cloexec
-    deps/brotli/c/include
     deps/golombset
     deps/hiredis
     deps/libgkc
@@ -235,12 +247,41 @@ ENDIF (ZLIB_FOUND)
 IF (PKG_CONFIG_FOUND)
     PKG_CHECK_MODULES(BROTLI_DEC libbrotlidec)
     PKG_CHECK_MODULES(BROTLI_ENC libbrotlienc)
-    IF (BROTLI_DEC_FOUND AND BROTLI_ENC_FOUND)
-        SET(BROTLI_FOUND TRUE)
-        INCLUDE_DIRECTORIES(${BROTLI_DEC_INCLUDE_DIRS} ${BROTLI_ENC_INCLUDE_DIRS})
-        LINK_DIRECTORIES(${BROTLI_DEC_LIBRARY_DIRS} ${BROTLI_ENC_LIBRARY_DIRS})
-    ENDIF (BROTLI_DEC_FOUND AND BROTLI_ENC_FOUND)
 ENDIF (PKG_CONFIG_FOUND)
+IF (BROTLI_DEC_FOUND AND BROTLI_ENC_FOUND)
+    SET(WITH_BROTLI_DEFAULT "ON")
+ELSE ()
+    SET(WITH_BROTLI_DEFAULT "OFF")
+ENDIF ()
+OPTION(WITH_BROTLI "whether or not to use brotli" ${WITH_BROTLI_DEFAULT})
+IF (WITH_BROTLI)
+    IF (NOT BROTLI_DEC_FOUND OR NOT BROTLI_ENC_FOUND)
+        MESSAGE(FATAL_ERROR "WITH_BROTLI was requested, but pkg-config could not find libbrotlidec and libbrotlienc")
+    ENDIF ()
+    ADD_DEFINITIONS("-DH2O_USE_BROTLI=1")
+    INCLUDE_DIRECTORIES(${BROTLI_DEC_INCLUDE_DIRS} ${BROTLI_ENC_INCLUDE_DIRS})
+    LINK_DIRECTORIES(${BROTLI_DEC_LIBRARY_DIRS} ${BROTLI_ENC_LIBRARY_DIRS})
+    LIST(APPEND EXTRA_LIBS ${BROTLI_DEC_LIBRARIES} ${BROTLI_ENC_LIBRARIES})
+ENDIF (WITH_BROTLI)
+
+IF (PKG_CONFIG_FOUND)
+    PKG_CHECK_MODULES(ZSTD libzstd)
+ENDIF (PKG_CONFIG_FOUND)
+IF (ZSTD_FOUND)
+    SET(WITH_ZSTD_DEFAULT "ON")
+ELSE ()
+    SET(WITH_ZSTD_DEFAULT "OFF")
+ENDIF ()
+OPTION(WITH_ZSTD "whether or not to use zstd" ${WITH_ZSTD_DEFAULT})
+IF (WITH_ZSTD)
+    IF (NOT ZSTD_FOUND)
+        MESSAGE(FATAL_ERROR "WITH_ZSTD was requested, but pkg-config could not find libzstd")
+    ENDIF ()
+    ADD_DEFINITIONS("-DH2O_USE_ZSTD=1")
+    INCLUDE_DIRECTORIES(${ZSTD_INCLUDE_DIRS})
+    LINK_DIRECTORIES(${ZSTD_LIBRARY_DIRS})
+    LIST(APPEND EXTRA_LIBS ${ZSTD_LIBRARIES})
+ENDIF (WITH_ZSTD)
 
 IF (PKG_CONFIG_FOUND)
     PKG_CHECK_MODULES(LIBCAP libcap)
@@ -252,7 +293,7 @@ IF (PKG_CONFIG_FOUND)
     ENDIF (LIBCAP_FOUND)
 ENDIF (PKG_CONFIG_FOUND)
 
-SET(CC_WARNING_FLAGS "-Wall -Wno-unused-value -Wno-unused-function -Wno-nullability-completeness -Wno-expansion-to-defined -Werror=implicit-function-declaration")
+SET(CC_WARNING_FLAGS "-Wall -Wno-unused-value -Wno-unused-function -Wno-nullability-completeness -Wno-expansion-to-defined -Werror=implicit-function-declaration -Werror=incompatible-pointer-types")
 
 IF ("${CMAKE_C_COMPILER_ID}" STREQUAL "GNU")
     IF (NOT ("${CMAKE_C_COMPILER_VERSION}" VERSION_LESS "4.6"))
@@ -264,14 +305,14 @@ IF ("${CMAKE_C_COMPILER_ID}" STREQUAL "GNU")
 ENDIF ()
 
 # setup compile flags
-SET(CMAKE_C_FLAGS "-g3 ${CC_WARNING_FLAGS} ${CMAKE_C_FLAGS} -DH2O_ROOT=\"${CMAKE_INSTALL_PREFIX}\" -DH2O_CONFIG_PATH=\"${CMAKE_INSTALL_FULL_SYSCONFDIR}/h2o.conf\"")
+SET(CMAKE_C_FLAGS "-g3 ${CC_WARNING_FLAGS} ${CMAKE_C_FLAGS} -DH2O_ROOT=\"${CMAKE_INSTALL_PREFIX}\" -DH2O_CONFIG_PATH=\"${CMAKE_INSTALL_FULL_SYSCONFDIR}/h2o.conf\" -DH2O_LOCALSTATEDIR=\"${CMAKE_INSTALL_FULL_LOCALSTATEDIR}\"")
 IF (WITH_DTRACE)
     SET(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -DPICOTLS_USE_DTRACE=1 -DQUICLY_USE_DTRACE=1 -DH2O_USE_DTRACE=1")
 ENDIF ()
 IF (NOT ARCH_SUPPORTS_64BIT_ATOMICS)
     SET(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -DH2O_NO_64BIT_ATOMICS")
 ENDIF (NOT ARCH_SUPPORTS_64BIT_ATOMICS)
-IF (CMAKE_SYSTEM_NAME STREQUAL "Linux")
+IF (CMAKE_SYSTEM_NAME STREQUAL "Linux" OR CMAKE_SYSTEM_NAME STREQUAL "Android")
     SET(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -pthread -D_GNU_SOURCE")
 ELSEIF ("${CMAKE_SYSTEM_NAME}" MATCHES "SunOS")
     SET(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -pthreads -D_POSIX_PTHREAD_SEMANTICS")
@@ -307,31 +348,6 @@ SET(LIBYAML_SOURCE_FILES
     deps/yaml/src/scanner.c
     deps/yaml/src/writer.c)
 
-SET(BROTLI_SOURCE_FILES
-    deps/brotli/c/common/dictionary.c
-    deps/brotli/c/dec/bit_reader.c
-    deps/brotli/c/dec/decode.c
-    deps/brotli/c/dec/huffman.c
-    deps/brotli/c/dec/state.c
-    deps/brotli/c/enc/backward_references.c
-    deps/brotli/c/enc/backward_references_hq.c
-    deps/brotli/c/enc/bit_cost.c
-    deps/brotli/c/enc/block_splitter.c
-    deps/brotli/c/enc/brotli_bit_stream.c
-    deps/brotli/c/enc/cluster.c
-    deps/brotli/c/enc/compress_fragment.c
-    deps/brotli/c/enc/compress_fragment_two_pass.c
-    deps/brotli/c/enc/dictionary_hash.c
-    deps/brotli/c/enc/encode.c
-    deps/brotli/c/enc/entropy_encode.c
-    deps/brotli/c/enc/histogram.c
-    deps/brotli/c/enc/literal_cost.c
-    deps/brotli/c/enc/memory.c
-    deps/brotli/c/enc/metablock.c
-    deps/brotli/c/enc/static_dict.c
-    deps/brotli/c/enc/utf8_util.c
-    lib/handler/compress/brotli.c)
-
 SET(LIB_SOURCE_FILES
     deps/cloexec/cloexec.c
     deps/hiredis/async.c
@@ -339,6 +355,7 @@ SET(LIB_SOURCE_FILES
     deps/hiredis/net.c
     deps/hiredis/read.c
     deps/hiredis/sds.c
+    deps/hiredis/alloc.c
     deps/libgkc/gkc.c
     deps/libyrmcds/close.c
     deps/libyrmcds/connect.c
@@ -355,15 +372,15 @@ SET(LIB_SOURCE_FILES
     deps/picotls/deps/cifra/src/drbg.c
     deps/picotls/deps/cifra/src/hmac.c
     deps/picotls/deps/cifra/src/sha256.c
-    deps/picotls/lib/certificate_compression.c
+    deps/picotls/lib/hpke.c
     deps/picotls/lib/pembase64.c
     deps/picotls/lib/picotls.c
     deps/picotls/lib/openssl.c
     deps/picotls/lib/cifra/random.c
     deps/picotls/lib/cifra/x25519.c
+    deps/quicly/lib/bplus_ranges.c
     deps/quicly/lib/cc-cubic.c
     deps/quicly/lib/cc-pico.c
-    deps/quicly/lib/cc-reno.c
     deps/quicly/lib/defaults.c
     deps/quicly/lib/frame.c
     deps/quicly/lib/local_cid.c
@@ -373,7 +390,6 @@ SET(LIB_SOURCE_FILES
     deps/quicly/lib/rate.c
     deps/quicly/lib/recvstate.c
     deps/quicly/lib/remote_cid.c
-    deps/quicly/lib/retire_cid.c
     deps/quicly/lib/sendstate.c
     deps/quicly/lib/sentmap.c
     deps/quicly/lib/streambuf.c
@@ -408,6 +424,7 @@ SET(LIB_SOURCE_FILES
     lib/core/context.c
     lib/core/headers.c
     lib/core/logconf.c
+    lib/core/pipe_sender.c
     lib/core/proxy.c
     lib/core/request.c
     lib/core/util.c
@@ -419,7 +436,10 @@ SET(LIB_SOURCE_FILES
     lib/handler/expires.c
     lib/handler/fastcgi.c
     lib/handler/file.c
+    lib/handler/h2olog.c
     lib/handler/headers.c
+    lib/handler/headers_util.c
+    lib/handler/http2_debug_state.c
     lib/handler/mimemap.c
     lib/handler/proxy.c
     lib/handler/connect.c
@@ -429,11 +449,10 @@ SET(LIB_SOURCE_FILES
     lib/handler/self_trace.c
     lib/handler/server_timing.c
     lib/handler/status.c
-    lib/handler/headers_util.c
     lib/handler/status/events.c
+    lib/handler/status/memory.c
     lib/handler/status/requests.c
     lib/handler/status/ssl.c
-    lib/handler/http2_debug_state.c
     lib/handler/status/durations.c
     lib/handler/configurator/access_log.c
     lib/handler/configurator/compress.c
@@ -441,7 +460,10 @@ SET(LIB_SOURCE_FILES
     lib/handler/configurator/expires.c
     lib/handler/configurator/fastcgi.c
     lib/handler/configurator/file.c
+    lib/handler/configurator/h2olog.c
     lib/handler/configurator/headers.c
+    lib/handler/configurator/headers_util.c
+    lib/handler/configurator/http2_debug_state.c
     lib/handler/configurator/proxy.c
     lib/handler/configurator/redirect.c
     lib/handler/configurator/reproxy.c
@@ -449,14 +471,9 @@ SET(LIB_SOURCE_FILES
     lib/handler/configurator/self_trace.c
     lib/handler/configurator/server_timing.c
     lib/handler/configurator/status.c
-    lib/handler/configurator/http2_debug_state.c
-    lib/handler/configurator/headers_util.c
 
     lib/http1.c
 
-    lib/tunnel.c
-
-    lib/http2/cache_digests.c
     lib/http2/casper.c
     lib/http2/connection.c
     lib/http2/frame.c
@@ -471,6 +488,16 @@ SET(LIB_SOURCE_FILES
     lib/http3/server.c
 
     ${CMAKE_CURRENT_BINARY_DIR}/quicly-tracer.h)
+
+IF (WITH_BROTLI)
+    LIST(APPEND LIB_SOURCE_FILES
+        deps/picotls/lib/certificate_compression.c
+        lib/handler/compress/brotli.c)
+ENDIF (WITH_BROTLI)
+IF (WITH_ZSTD)
+    LIST(APPEND LIB_SOURCE_FILES
+        lib/handler/compress/zstd.c)
+ENDIF (WITH_ZSTD)
 
 IF (WITH_DTRACE)
     DEFINE_DTRACE_DEPENDENCIES(${CMAKE_SOURCE_DIR}/deps/picotls/picotls-probes.d picotls)
@@ -491,7 +518,6 @@ ENDIF ()
 SET(UNIT_TEST_SOURCE_FILES
     ${LIB_SOURCE_FILES}
     ${LIBYAML_SOURCE_FILES}
-    ${BROTLI_SOURCE_FILES}
     deps/picotest/picotest.c
     t/00unit/test.c
     t/00unit/lib/common/balancer/least_conn.c
@@ -502,12 +528,14 @@ SET(UNIT_TEST_SOURCE_FILES
     t/00unit/lib/common/multithread.c
     t/00unit/lib/common/serverutil.c
     t/00unit/lib/common/socket.c
+    t/00unit/lib/common/socketpool.c
     t/00unit/lib/common/string.c
     t/00unit/lib/common/rand.c
     t/00unit/lib/common/time.c
     t/00unit/lib/common/url.c
     t/00unit/lib/common/timerwheel.c
     t/00unit/lib/common/absprio.c
+    t/00unit/lib/core/config.c
     t/00unit/lib/core/headers.c
     t/00unit/lib/core/proxy.c
     t/00unit/lib/core/util.c
@@ -518,7 +546,7 @@ SET(UNIT_TEST_SOURCE_FILES
     t/00unit/lib/handler/headers.c
     t/00unit/lib/handler/mimemap.c
     t/00unit/lib/handler/redirect.c
-    t/00unit/lib/http2/cache_digests.c
+    t/00unit/lib/handler/throttle_resp.c
     t/00unit/lib/http2/casper.c
     t/00unit/lib/http2/hpack.c
     t/00unit/lib/http2/scheduler.c
@@ -538,6 +566,7 @@ LIST(REMOVE_ITEM UNIT_TEST_SOURCE_FILES
     lib/common/multithread.c
     lib/common/serverutil.c
     lib/common/socket.c
+    lib/common/socketpool.c
     lib/common/string.c
     lib/common/rand.c
     lib/common/time.c
@@ -555,7 +584,7 @@ LIST(REMOVE_ITEM UNIT_TEST_SOURCE_FILES
     lib/handler/headers.c
     lib/handler/mimemap.c
     lib/handler/redirect.c
-    lib/http2/cache_digests.c
+    lib/handler/throttle_resp.c
     lib/http2/casper.c
     lib/http2/hpack.c
     lib/http2/scheduler.c
@@ -565,8 +594,7 @@ LIST(REMOVE_ITEM UNIT_TEST_SOURCE_FILES
 
 SET(FUZZED_SOURCE_FILES
     ${LIB_SOURCE_FILES}
-    ${LIBYAML_SOURCE_FILES}
-    ${BROTLI_SOURCE_FILES})
+    ${LIBYAML_SOURCE_FILES})
 
 # Remove some of quicly files for fuzzing to allow the mockup library to come in
 LIST(REMOVE_ITEM FUZZED_SOURCE_FILES
@@ -575,7 +603,6 @@ LIST(REMOVE_ITEM FUZZED_SOURCE_FILES
     deps/quicly/lib/loss.c
     deps/quicly/lib/quicly.c
     deps/quicly/lib/remote_cid.c
-    deps/quicly/lib/retire_cid.c
     deps/quicly/lib/sentmap.c
     deps/quicly/lib/streambuf.c
     #deps/quicly/lib/cc-cubic.c
@@ -591,7 +618,6 @@ SET(EXTRA_LIBS ${EXTRA_LIBS} m ${CMAKE_THREAD_LIBS_INIT})
 IF (ZLIB_FOUND)
     LIST(INSERT EXTRA_LIBS 0 ${ZLIB_LIBRARIES})
 ENDIF (ZLIB_FOUND)
-
 IF (WSLAY_FOUND)
     ADD_LIBRARY(libh2o lib/websocket.c ${LIB_SOURCE_FILES})
     ADD_LIBRARY(libh2o-evloop lib/websocket.c ${LIB_SOURCE_FILES})
@@ -599,6 +625,20 @@ ELSE ()
     ADD_LIBRARY(libh2o ${LIB_SOURCE_FILES})
     ADD_LIBRARY(libh2o-evloop ${LIB_SOURCE_FILES})
 ENDIF (WSLAY_FOUND)
+
+EXECUTE_PROCESS(
+    COMMAND sed -n -E "/#define {1,}H2O_VERSION_BASE .*-DEV\"$/s//YES/p" ${CMAKE_CURRENT_SOURCE_DIR}/include/h2o/version.h
+    OUTPUT_VARIABLE IS_PRERELEASE
+    OUTPUT_STRIP_TRAILING_WHITESPACE)
+EXECUTE_PROCESS(
+    COMMAND sed -n -E "/#define {1,}H2O_LIBRARY_VERSION {1,}\"(.*)\"$/s//\\1/p" ${CMAKE_CURRENT_SOURCE_DIR}/include/h2o/version.h
+    OUTPUT_VARIABLE LIBRARY_VERSION
+    OUTPUT_STRIP_TRAILING_WHITESPACE)
+EXECUTE_PROCESS(
+    COMMAND sed -n -E "/#define {1,}H2O_LIBRARY_VERSION {1,}\"(.*)\\.[0-9]{1,}\"$/s//\\1/p" ${CMAKE_CURRENT_SOURCE_DIR}/include/h2o/version.h
+    OUTPUT_VARIABLE LIBRARY_SOVERSION
+    OUTPUT_STRIP_TRAILING_WHITESPACE)
+MESSAGE(STATUS "extracted version numbers from ${CMAKE_CURRENT_SOURCE_DIR}/include/h2o/version.h:\n\tprerelease=${IS_PRERELEASE}\n\tlibrary version=${LIBRARY_VERSION}\n\tlibrary soversion=${LIBRARY_SOVERSION}")
 
 SET_TARGET_PROPERTIES(libh2o PROPERTIES
     OUTPUT_NAME h2o
@@ -624,14 +664,10 @@ TARGET_INCLUDE_DIRECTORIES(libh2o PUBLIC ${OPENSSL_INCLUDE_DIR})
 TARGET_INCLUDE_DIRECTORIES(libh2o-evloop PUBLIC ${OPENSSL_INCLUDE_DIR})
 TARGET_LINK_LIBRARIES(libh2o ${OPENSSL_LIBRARIES} ${CMAKE_DL_LIBS})
 TARGET_LINK_LIBRARIES(libh2o-evloop ${OPENSSL_LIBRARIES} ${CMAKE_DL_LIBS})
-IF (BROTLI_FOUND)
-    TARGET_LINK_LIBRARIES(libh2o ${BROTLI_DEC_LIBRARIES} ${BROTLI_ENC_LIBRARIES})
-    TARGET_LINK_LIBRARIES(libh2o-evloop ${BROTLI_DEC_LIBRARIES} ${BROTLI_ENC_LIBRARIES})
-ENDIF ()
 
 ADD_CUSTOM_COMMAND(
     OUTPUT quicly-tracer.h
-    COMMAND ${PROJECT_SOURCE_DIR}/deps/quicly/misc/probe2trace.pl -a tracer < ${PROJECT_SOURCE_DIR}/deps/quicly/quicly-probes.d > ${CMAKE_CURRENT_BINARY_DIR}/quicly-tracer.h
+    COMMAND sh -c "'${PROJECT_SOURCE_DIR}'/deps/quicly/misc/probe2trace.pl -a tracer < '${PROJECT_SOURCE_DIR}'/deps/quicly/quicly-probes.d > '${CMAKE_CURRENT_BINARY_DIR}'/quicly-tracer.h"
     DEPENDS deps/quicly/quicly-probes.d deps/quicly/misc/probe2trace.pl
     VERBATIM)
 
@@ -701,12 +737,12 @@ SET_TARGET_PROPERTIES(examples-websocket-evloop PROPERTIES
     EXCLUDE_FROM_ALL 1)
 TARGET_LINK_LIBRARIES(examples-websocket-evloop libh2o-evloop ${WSLAY_LIBRARIES} ${EXTRA_LIBS})
 
-IF (LIBUV_FOUND AND BROTLI_FOUND AND NOT WITHOUT_LIBS)
+IF (LIBUV_FOUND AND NOT WITHOUT_LIBS)
     INSTALL(TARGETS libh2o DESTINATION ${CMAKE_INSTALL_LIBDIR})
 ELSE ()
     SET_TARGET_PROPERTIES(libh2o PROPERTIES EXCLUDE_FROM_ALL 1)
 ENDIF ()
-IF (BROTLI_FOUND AND NOT WITHOUT_LIBS)
+IF (NOT WITHOUT_LIBS)
     INSTALL(TARGETS libh2o-evloop DESTINATION ${CMAKE_INSTALL_LIBDIR})
     INSTALL(TARGETS h2o-httpclient DESTINATION ${CMAKE_INSTALL_BINDIR})
 ELSE ()
@@ -718,11 +754,10 @@ ENDIF()
 SET(STANDALONE_SOURCE_FILES
     ${LIB_SOURCE_FILES}
     ${LIBYAML_SOURCE_FILES}
-    ${BROTLI_SOURCE_FILES}
     deps/neverbleed/neverbleed.c
     src/main.c
     src/ssl.c)
-SET(STANDALONE_COMPILE_FLAGS "-DH2O_USE_LIBUV=0 -DH2O_USE_BROTLI=1 -DQUICLY_USE_TRACER=1")
+SET(STANDALONE_COMPILE_FLAGS "-DH2O_USE_LIBUV=0 -DQUICLY_USE_TRACER=1")
 IF (WITH_MRUBY)
     IF (${CMAKE_C_COMPILER_ID} STREQUAL "Clang")
         SET(MRUBY_TOOLCHAIN "clang")
@@ -732,10 +767,10 @@ IF (WITH_MRUBY)
     ADD_CUSTOM_TARGET(mruby
         # deps/mruby/tasks/toolchains/clang.rake looks for CC, CXX and LD.
         # There are no C++ files in deps/mruby, use the C compiler for linking.
-        MRUBY_TOOLCHAIN=${MRUBY_TOOLCHAIN} CC=${CMAKE_C_COMPILER} CXX=${CMAKE_CXX_COMPILER} LD=${CMAKE_C_COMPILER} MRUBY_CONFIG=${CMAKE_CURRENT_SOURCE_DIR}/misc/mruby_config.rb MRUBY_BUILD_DIR=${CMAKE_CURRENT_BINARY_DIR}/mruby MRUBY_ADDITIONAL_CONFIG=${MRUBY_ADDITIONAL_CONFIG} ruby minirake
+        MRUBY_TOOLCHAIN=${MRUBY_TOOLCHAIN} CC=${CMAKE_C_COMPILER} CXX=${CMAKE_CXX_COMPILER} LD=${CMAKE_C_COMPILER} MRUBY_CONFIG=${CMAKE_CURRENT_SOURCE_DIR}/misc/mruby_config.rb MRUBY_BUILD_DIR=${CMAKE_CURRENT_BINARY_DIR}/mruby MRUBY_ADDITIONAL_CONFIG=${MRUBY_ADDITIONAL_CONFIG} INSTALL_DIR=${CMAKE_CURRENT_BINARY_DIR}/mruby-bin ruby minirake
         WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}/deps/mruby
         BYPRODUCTS "${CMAKE_CURRENT_BINARY_DIR}/mruby/host/lib/libmruby.a"
-                   "${CMAKE_CURRENT_BINARY_DIR}/mruby/host/mrbgems/mruby-onig-regexp/onigmo-6.1.2/.libs/libonigmo.a"
+                   "${CMAKE_CURRENT_BINARY_DIR}/mruby/host/mrbgems/mruby-onig-regexp/onigmo-6.2.0/.libs/libonigmo.a"
     )
     LIST(APPEND STANDALONE_SOURCE_FILES
         lib/handler/mruby.c
@@ -749,6 +784,22 @@ IF (WITH_MRUBY)
     SET(STANDALONE_COMPILE_FLAGS "${STANDALONE_COMPILE_FLAGS} -DH2O_USE_MRUBY=1")
     SET_PROPERTY(DIRECTORY PROPERTY ADDITIONAL_MAKE_CLEAN_FILES ${CMAKE_CURRENT_BINARY_DIR}/mruby/)
 ENDIF (WITH_MRUBY)
+IF (WITH_FUSION)
+    SET(STANDALONE_COMPILE_FLAGS "${STANDALONE_COMPILE_FLAGS} -DH2O_USE_FUSION=1")
+    LIST(APPEND STANDALONE_SOURCE_FILES deps/picotls/lib/fusion.c)
+    SET_SOURCE_FILES_PROPERTIES(deps/picotls/lib/fusion.c PROPERTIES COMPILE_FLAGS "-mavx2 -maes -mpclmul -mvaes -mvpclmulqdq")
+ENDIF ()
+IF (WITH_KTLS)
+    SET(STANDALONE_COMPILE_FLAGS "${STANDALONE_COMPILE_FLAGS} -DH2O_USE_KTLS=1")
+ENDIF ()
+IF (WITH_AEGIS)
+    SET(STANDALONE_COMPILE_FLAGS "${STANDALONE_COMPILE_FLAGS} -DPTLS_HAVE_AEGIS=1")
+ENDIF ()
+IF (WITH_IO_URING)
+    # io_uring is enabled only for standalone server, as it is impossible to cleanly shutdown synchronously
+    SET(STANDALONE_COMPILE_FLAGS "${STANDALONE_COMPILE_FLAGS} -DH2O_USE_IO_URING=1")
+    LIST(APPEND STANDALONE_SOURCE_FILES lib/common/io_uring.c)
+ENDIF ()
 ADD_EXECUTABLE(h2o ${STANDALONE_SOURCE_FILES})
 SET_TARGET_PROPERTIES(h2o PROPERTIES COMPILE_FLAGS "${STANDALONE_COMPILE_FLAGS}")
 TARGET_INCLUDE_DIRECTORIES(h2o PUBLIC ${OPENSSL_INCLUDE_DIR})
@@ -758,10 +809,19 @@ IF (WITH_MRUBY)
     # note: the paths need to be determined before libmruby.flags.mak is generated
     TARGET_LINK_LIBRARIES(h2o
         "${CMAKE_CURRENT_BINARY_DIR}/mruby/host/lib/libmruby.a"
-        "${CMAKE_CURRENT_BINARY_DIR}/mruby/host/mrbgems/mruby-onig-regexp/onigmo-6.1.2/.libs/libonigmo.a"
+        "${CMAKE_CURRENT_BINARY_DIR}/mruby/host/mrbgems/mruby-onig-regexp/onigmo-6.2.0/.libs/libonigmo.a"
         "m")
     ADD_DEPENDENCIES(h2o mruby)
 ENDIF (WITH_MRUBY)
+IF (WITH_AEGIS)
+    TARGET_INCLUDE_DIRECTORIES(h2o PUBLIC ${aegis_INCLUDE_DIR})
+    TARGET_LINK_LIBRARIES(h2o ${aegis_LIBRARIES})
+ENDIF ()
+IF (WITH_IO_URING)
+    TARGET_INCLUDE_DIRECTORIES(h2o PUBLIC ${LIBURING_INCLUDE_DIRS})
+    TARGET_LINK_DIRECTORIES(h2o PUBLIC ${LIBURING_LIBRARY_DIRS})
+    TARGET_LINK_LIBRARIES(h2o ${LIBURING_LIBRARIES})
+ENDIF ()
 TARGET_LINK_LIBRARIES(h2o ${EXTRA_LIBS})
 
 INSTALL(TARGETS h2o
@@ -770,11 +830,16 @@ INSTALL(TARGETS h2o
 
 IF (NOT WITHOUT_LIBS)
     INSTALL(DIRECTORY include/ DESTINATION ${CMAKE_INSTALL_INCLUDEDIR} FILES_MATCHING PATTERN "*.h")
+    INSTALL(DIRECTORY deps/picotls/include/ DESTINATION ${CMAKE_INSTALL_INCLUDEDIR} FILES_MATCHING PATTERN "*.h")
+    INSTALL(DIRECTORY deps/quicly/include/ DESTINATION ${CMAKE_INSTALL_INCLUDEDIR} FILES_MATCHING PATTERN "*.h")
     IF (LIBUV_FOUND)
         INSTALL(FILES "${CMAKE_BINARY_DIR}/libh2o.pc" DESTINATION ${CMAKE_INSTALL_LIBDIR}/pkgconfig)
     ENDIF ()
     INSTALL(FILES "${CMAKE_BINARY_DIR}/libh2o-evloop.pc" DESTINATION ${CMAKE_INSTALL_LIBDIR}/pkgconfig)
 ENDIF ()
+
+# h2olog is installed directly without fatpacking in misc/regen.pl, as it relies only on standard modules
+INSTALL(PROGRAMS misc/h2olog DESTINATION ${CMAKE_INSTALL_BINDIR})
 
 INSTALL(PROGRAMS share/h2o/annotate-backtrace-symbols share/h2o/fastcgi-cgi share/h2o/fetch-ocsp-response share/h2o/kill-on-close share/h2o/setuidgid share/h2o/start_server DESTINATION ${CMAKE_INSTALL_DATAROOTDIR}/h2o)
 INSTALL(FILES share/h2o/ca-bundle.crt DESTINATION ${CMAKE_INSTALL_DATAROOTDIR}/h2o)
@@ -787,13 +852,19 @@ IF (WITH_MRUBY)
     INSTALL(DIRECTORY share/h2o/mruby DESTINATION ${CMAKE_INSTALL_DATAROOTDIR}/h2o)
 ENDIF (WITH_MRUBY)
 
+# ACME integration: install files and create directories
+INSTALL(PROGRAMS share/h2o/acme/lego-loader DESTINATION ${CMAKE_INSTALL_DATAROOTDIR}/h2o/acme)
+INSTALL(FILES share/h2o/acme/loading.crt share/h2o/acme/loading.key DESTINATION ${CMAKE_INSTALL_DATAROOTDIR}/h2o/acme)
+INSTALL(DIRECTORY DESTINATION ${CMAKE_INSTALL_LOCALSTATEDIR}/h2o/acme/certificates)
+INSTALL(DIRECTORY DESTINATION ${CMAKE_INSTALL_LOCALSTATEDIR}/h2o/acme/webroot)
+
 # tests
 ADD_EXECUTABLE(t-00unit-evloop.t ${UNIT_TEST_SOURCE_FILES})
 SET_TARGET_PROPERTIES(t-00unit-evloop.t PROPERTIES
-    COMPILE_FLAGS "-DH2O_USE_LIBUV=0 -DH2O_USE_BROTLI=1 -DH2O_UNITTEST=1"
+    COMPILE_FLAGS "-DH2O_USE_LIBUV=0 -DH2O_UNITTEST=1"
     EXCLUDE_FROM_ALL 1)
 
-IF(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/deps/theft/Makefile AND BROTLI_FOUND)
+IF(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/deps/theft/Makefile AND WITH_BROTLI)
     ExternalProject_Add(build-theft
                         SOURCE_DIR "${CMAKE_CURRENT_SOURCE_DIR}/deps/theft"
                         BINARY_DIR "${CMAKE_CURRENT_BINARY_DIR}/theft"
@@ -813,7 +884,7 @@ ENDIF ()
 IF (LIBUV_FOUND)
     ADD_EXECUTABLE(t-00unit-libuv.t ${UNIT_TEST_SOURCE_FILES})
     SET_TARGET_PROPERTIES(t-00unit-libuv.t PROPERTIES
-        COMPILE_FLAGS "-DH2O_USE_BROTLI=1 -DH2O_UNITTEST=1"
+        COMPILE_FLAGS "-DH2O_UNITTEST=1"
         EXCLUDE_FROM_ALL 1)
 ENDIF (LIBUV_FOUND)
 
@@ -826,18 +897,16 @@ ENDIF (LIBUV_FOUND)
 
 ADD_CUSTOM_TARGET(checkdepends
     WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}
-    DEPENDS h2o t-00unit-evloop.t ${OPTIONAL_TEST})
+    DEPENDS h2o t-00unit-evloop.t t-qif ${OPTIONAL_TEST})
 IF (LIBUV_FOUND)
     ADD_DEPENDENCIES(checkdepends t-00unit-libuv.t)
 ENDIF ()
-IF (BROTLI_FOUND)
-    IF (LIBUV_FOUND)
-        ADD_DEPENDENCIES(checkdepends lib-examples)
-    ENDIF ()
-    ADD_DEPENDENCIES(checkdepends lib-examples-evloop)
+IF (LIBUV_FOUND)
+    ADD_DEPENDENCIES(checkdepends lib-examples)
 ENDIF ()
+ADD_DEPENDENCIES(checkdepends lib-examples-evloop)
 
-ADD_CUSTOM_TARGET(check env H2O_ROOT=. BINARY_DIR=${CMAKE_CURRENT_BINARY_DIR} prove -I. -v t/*.t
+ADD_CUSTOM_TARGET(check env H2O_ROOT=. BINARY_DIR=${CMAKE_CURRENT_BINARY_DIR} time t/run-tests t/*.t
     WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}
     DEPENDS checkdepends)
 
@@ -850,9 +919,11 @@ ADD_CUSTOM_TARGET(doc-publish ${CMAKE_MAKE_PROGRAM} -f ../misc/doc.mk publish BI
     WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}/doc
     DEPENDS h2o)
 
-GET_FILENAME_COMPONENT(EXTERNALPROJECT_SSL_ROOT_DIR ${OPENSSL_INCLUDE_DIR} PATH)
+IF (NOT EXTERNALPROJECT_SSL_ROOT_DIR)
+    GET_FILENAME_COMPONENT(EXTERNALPROJECT_SSL_ROOT_DIR ${OPENSSL_INCLUDE_DIR} PATH)
+ENDIF ()
 
-IF (EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/misc/h2get/CMakeLists.txt AND RUBY AND BISON)
+IF (EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/misc/h2get/CMakeLists.txt AND RUBY AND BISON AND NOT (OPENSSL_VERSION VERSION_LESS "1.1.1"))
     ExternalProject_Add(h2get
                         CONFIGURE_COMMAND ${CMAKE_COMMAND} -DH2GET_SSL_ROOT_DIR=${EXTERNALPROJECT_SSL_ROOT_DIR} ${CMAKE_CURRENT_SOURCE_DIR}/misc/h2get
                         SOURCE_DIR ${CMAKE_CURRENT_SOURCE_DIR}/misc/h2get
@@ -881,7 +952,7 @@ ExternalProject_Add(quicly-cli
 SET_TARGET_PROPERTIES(quicly-cli PROPERTIES EXCLUDE_FROM_ALL TRUE)
 ADD_DEPENDENCIES(checkdepends quicly-cli)
 
-ADD_CUSTOM_TARGET(check-valgrind env H2O_VALGRIND=./misc/h2o_valgrind/ H2O_ROOT=. BINARY_DIR=${CMAKE_CURRENT_BINARY_DIR} prove -I. -v t/*.t
+ADD_CUSTOM_TARGET(check-valgrind env H2O_VALGRIND=./misc/h2o_valgrind/ H2O_ROOT=. BINARY_DIR=${CMAKE_CURRENT_BINARY_DIR} PERL5LIB=.:deps/quicly prove -v t/*.t
     WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}
     DEPENDS h2o t-00unit-evloop.t)
 
@@ -899,13 +970,17 @@ IF (BUILD_FUZZER)
     SET_TARGET_PROPERTIES(h2o-fuzzer-http3 PROPERTIES COMPILE_FLAGS "-DH2O_USE_LIBUV=0")
     SET_TARGET_PROPERTIES(h3-header-generator PROPERTIES COMPILE_FLAGS "-DH2O_USE_LIBUV=0")
     SET(CMAKE_EXE_LINKER_FLAGS "${CMAKE_C_FLAGS}")
+    ADD_DEPENDENCIES(checkdepends h2o-fuzzer-http1 h2o-fuzzer-http2 h2o-fuzzer-http3 h2o-fuzzer-url)
     IF (OSS_FUZZ)
         # Use https://github.com/google/oss-fuzz compatible options
         SET(LIB_FUZZER FuzzingEngine)
         SET(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -fno-omit-frame-pointer")
         SET(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -fno-omit-frame-pointer")
     ELSE ()
-        EXEC_PROGRAM(${CMAKE_CXX_COMPILER} ARGS "--version 2>&1 | grep version" OUTPUT_VARIABLE _clang_version_info)
+        EXECUTE_PROCESS(
+            COMMAND ${CMAKE_CXX_COMPILER} --version
+            OUTPUT_VARIABLE _clang_version_info
+            ERROR_VARIABLE _clang_version_info)
         STRING(REGEX REPLACE "^.*[ ]version[ ]([0-9]+)\\.[0-9]+.*" "\\1" CLANG_MAJOR "${_clang_version_info}")
         STRING(REGEX REPLACE "^.*[ ]version[ ][0-9]+\\.([0-9]+).*" "\\1" CLANG_MINOR "${_clang_version_info}")
 
@@ -940,6 +1015,7 @@ IF (BUILD_FUZZER)
     TARGET_LINK_LIBRARIES(h2o-fuzzer-http2 libh2o-evloop ${EXTRA_LIBS} ${LIB_FUZZER})
     # h3 fuzzer does not use libh2o so it can replace quicly with quicly_mock
     TARGET_LINK_LIBRARIES(h2o-fuzzer-http3 ${EXTRA_LIBS} ${LIB_FUZZER} ${OPENSSL_LIBRARIES} ${CMAKE_DL_LIBS})
+    TARGET_INCLUDE_DIRECTORIES(h2o-fuzzer-http3 PUBLIC ${OPENSSL_INCLUDE_DIR})
     TARGET_LINK_LIBRARIES(h2o-fuzzer-url libh2o-evloop ${EXTRA_LIBS} ${LIB_FUZZER})
     TARGET_LINK_LIBRARIES(h3-header-generator libh2o-evloop ${EXTRA_LIBS})
 
@@ -956,89 +1032,12 @@ ELSEIF ("${CMAKE_SYSTEM_NAME}" MATCHES "SunOS")
     ENDIF (LIBUV_FOUND)
 ENDIF ()
 
-# h2olog
-# If BCC is installed to a non-default directory,
-# set something like `PKG_CONFIG_PATH=/path/to/bcc/lib/pkgconfig cmake ...`
-IF (CMAKE_SYSTEM_NAME STREQUAL "Linux" AND PKG_CONFIG_FOUND)
-    PKG_CHECK_MODULES(LIBBCC libbcc)
-
-    EXECUTE_PROCESS(
-        COMMAND uname -r
-        OUTPUT_VARIABLE KERNEL_VERSION
-        OUTPUT_STRIP_TRAILING_WHITESPACE
-    )
-
-    SET(REQUIRED_KERNEL_VERSION "4.10.0")
-    IF (NOT (KERNEL_VERSION VERSION_LESS REQUIRED_KERNEL_VERSION))
-        SET(HAVE_BPF_SUPPORTED_KERNEL ON)
-        MESSAGE(STATUS "Checking Linux kernel version ${KERNEL_VERSION} >= ${REQUIRED_KERNEL_VERSION} for h2olog - OK")
-    ENDIF ()
-
-    IF (NOT (CMAKE_VERSION VERSION_LESS "3.8"))
-        CMAKE_POLICY(SET CMP0057 NEW)
-        IF ("cxx_std_11" IN_LIST CMAKE_CXX_COMPILE_FEATURES)
-            MESSAGE(STATUS "C++11 OK")
-            SET(CXX_11 ON)
-        ENDIF ()
-    ENDIF ()
-
-    IF (WITH_DTRACE AND LIBBCC_FOUND AND HAVE_BPF_SUPPORTED_KERNEL AND CXX_11)
-        SET(WITH_H2OLOG_DEFAULT ON)
-    ENDIF ()
-ENDIF ()
-
-OPTION(WITH_H2OLOG "use h2olog command" ${WITH_H2OLOG_DEFAULT})
-IF (WITH_H2OLOG)
-    MESSAGE(STATUS "Supporting h2olog")
-
-    SET(H2OLOG_SOURCE_FILES
-        "src/h2olog/h2olog.h"
-        "src/h2olog/h2olog.cc"
-        "src/h2olog/http_tracer.cc"
-        "src/h2olog/json.h"
-        "src/h2olog/json.cc"
-        "include/h2o/version.h"
-    )
-
-    # This phony target is required to force to trigger a custom command.
-    # If DEPENDS is empty, the custom command won't be triggered when OUTPUT files exist.
-    ADD_CUSTOM_COMMAND(OUTPUT phony_force_trigger_command COMMAND echo -n)
-
-    ADD_CUSTOM_COMMAND(
-        OUTPUT  "${CMAKE_CURRENT_SOURCE_DIR}/src/h2olog/generated_raw_tracer.cc"
-        COMMAND make -f misc/regen.mk src/h2olog/generated_raw_tracer.cc
-        WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}
-        DEPENDS phony_force_trigger_command
-    )
-    LIST(APPEND H2OLOG_SOURCE_FILES "${CMAKE_CURRENT_SOURCE_DIR}/src/h2olog/generated_raw_tracer.cc")
-    LINK_DIRECTORIES("${LIBBCC_LIBRARY_DIRS}")
-
-    ADD_EXECUTABLE(h2olog ${H2OLOG_SOURCE_FILES})
-    ADD_DEPENDENCIES(checkdepends h2olog)
-    TARGET_LINK_LIBRARIES(h2olog libh2o-evloop ${EXTRA_LIBS})
-
-    SET_TARGET_PROPERTIES(h2olog PROPERTIES
-        CXX_STANDARD 11
-        CXX_STANDARD_REQUIRED ON
-        CXX_EXTENSIONS OFF
-        COMPILE_FLAGS "-DH2O_USE_LIBUV=0"
-    )
-
-    TARGET_LINK_LIBRARIES(h2olog "${LIBBCC_LIBRARIES}")
-    TARGET_INCLUDE_DIRECTORIES(h2olog
-        PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/src/h2olog"
-        PRIVATE "${LIBBCC_INCLUDE_DIRS}"
-    )
-
-    INSTALL(TARGETS h2olog RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR})
-ENDIF (WITH_H2OLOG)
-
 # gitrev
-IF ("${VERSION_PRERELEASE}" STREQUAL "-DEV")
+IF (IS_PRERELEASE)
     # To ask generate_gitrev.pl whether or not a gitrev is available,
     # since only the script knows how to calculate the gitrev.
     EXECUTE_PROCESS(
-        COMMAND perl ${CMAKE_CURRENT_SOURCE_DIR}/misc/generate_gitrev.pl
+        COMMAND perl ${CMAKE_CURRENT_SOURCE_DIR}/misc/generate_gitrev.pl ${CMAKE_CURRENT_BINARY_DIR}/h2o-gitrev.h
         WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}
         RESULT_VARIABLE GITREV_RESULT_CODE
         OUTPUT_QUIET
@@ -1048,7 +1047,7 @@ IF ("${VERSION_PRERELEASE}" STREQUAL "-DEV")
     IF (GITREV_RESULT_CODE EQUAL 0)
         ADD_DEFINITIONS("-DH2O_HAS_GITREV_H")
         ADD_CUSTOM_TARGET(gitrev ALL
-            COMMAND perl ${CMAKE_CURRENT_SOURCE_DIR}/misc/generate_gitrev.pl
+            COMMAND perl ${CMAKE_CURRENT_SOURCE_DIR}/misc/generate_gitrev.pl ${CMAKE_CURRENT_BINARY_DIR}/h2o-gitrev.h
             WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR})
         ADD_DEPENDENCIES(libh2o gitrev)
         ADD_DEPENDENCIES(libh2o-evloop gitrev)
@@ -1062,3 +1061,13 @@ IF ("${VERSION_PRERELEASE}" STREQUAL "-DEV")
         ENDIF (TARGET h2olog)
     ENDIF ()
 ENDIF ()
+
+# injectaddr.so
+IF (CMAKE_SYSTEM_NAME STREQUAL "Linux" OR CMAKE_SYSTEM_NAME STREQUAL "Android" OR APPLE)
+    ADD_LIBRARY(injectaddr SHARED t/injectaddr.c)
+    SET_TARGET_PROPERTIES(injectaddr PROPERTIES EXCLUDE_FROM_ALL 1)
+    IF (CMAKE_SYSTEM_NAME STREQUAL "Linux")
+        TARGET_LINK_LIBRARIES(injectaddr dl)
+    ENDIF ()
+    ADD_DEPENDENCIES(checkdepends injectaddr)
+ENDIF()
